@@ -155,7 +155,7 @@ pub struct ChrIns {
     pub p2p_entity_handle: P2PEntityHandle,
     unk78: usize,
     /// Position in global map chunk coordinates.
-    pub chunk_position: F32Vector4,
+    pub chunk_position: HavokPosition,
     /// Initial position of the character when it was created.
     pub initial_position: HavokPosition,
     /// Initial orientation of the character when it was created (in euler angles).
