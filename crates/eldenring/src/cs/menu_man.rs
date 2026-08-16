@@ -5,7 +5,7 @@ use pelite::pe64::Pe;
 use shared::{OwnedPtr, program::Program};
 
 use super::{CSEzTask, CSEzUpdateTask, OptionalItemId};
-use crate::{DLDeque, cs::MenuString, rva};
+use crate::{DLDeque, cs::MenuString, dlkr::MainHeapAllocator, rva};
 
 pub const STATUS_MESSAGE_DEMIGOD_FELLED: i32 = 1;
 pub const STATUS_MESSAGE_LEGEND_FELLED: i32 = 2;
@@ -65,7 +65,7 @@ pub struct CSMenuManImp {
     pub back_screen_data: BackScreenData,
     pub loading_screen_data: LoadingScreenData,
     unk748: [u8; 0x118],
-    pub system_announce_view_model: OwnedPtr<FeSystemAnnounceViewModel>,
+    pub system_announce_view_model: OwnedPtr<FeSystemAnnounceViewModel, MainHeapAllocator>,
     pub update_task: CSEzUpdateTask<CSEzTask, Self>,
     unk890: [u8; 0x10],
 }

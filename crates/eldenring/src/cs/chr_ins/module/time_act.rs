@@ -7,7 +7,10 @@ use std::ptr::NonNull;
 
 use shared::{OwnedPtr, Subclass, Superclass};
 
-use crate::cs::ChrIns;
+use crate::{
+    cs::ChrIns,
+    dlkr::{InGameHeapAllocator, MainHeapAllocator},
+};
 
 #[repr(C)]
 /// Source of name: RTTI
@@ -15,7 +18,7 @@ pub struct CSChrTimeActModule {
     vftable: usize,
     pub owner: NonNull<ChrIns>,
     pub hvk_anim: Option<NonNull<HvkAnim>>,
-    pub chr_tae_anim_event: OwnedPtr<CSChrTaeAnimEvent>,
+    pub chr_tae_anim_event: OwnedPtr<CSChrTaeAnimEvent, InGameHeapAllocator>,
     /// Circular buffer of animations to play.
     pub anim_queue: [CSChrTimeActModuleAnim; 10],
     /// Index of the next animation to play or update.
@@ -65,7 +68,7 @@ pub struct HvkAnim {
     pub animation_count: u32,
     /// Pointer to `HvkAnimTaeBinding` of `animation_count` amount
     animations: NonNull<()>,
-    pub tae_dat: OwnedPtr<TaeDat>,
+    pub tae_dat: OwnedPtr<TaeDat, MainHeapAllocator>,
     /// Name of the animbnd data belongs to, eg `c0000` for the player
     pub name: NonNull<u16>,
     unkb8: bool,
@@ -82,7 +85,7 @@ pub struct HvkAnimContainer {
 pub struct TaeDat {
     vftable: usize,
     pub tae_files: [Option<NonNull<TAE_Header_Main>>; 999],
-    pub tae_resolvers: [Option<OwnedPtr<TaeFileResolver>>; 999],
+    pub tae_resolvers: [Option<OwnedPtr<TaeFileResolver, MainHeapAllocator>>; 999],
     /// Not sure what's this about; True when BND4 file entry unk1 is not 0
     pub file_states: [bool; 999],
 }

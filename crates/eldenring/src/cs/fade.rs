@@ -10,7 +10,7 @@ use shared::{F32Vector4, OwnedPtr};
 #[shared::singleton("CSFade")]
 pub struct CSFade {
     vftable: usize,
-    pub fade_system: OwnedPtr<CSFD4FadeSystem>,
+    pub fade_system: OwnedPtr<CSFD4FadeSystem, MainHeapAllocator>,
     /// Holds the individual fade plates, these control the actual drawing of the dimming.
     pub fade_plates: [OwnedPtr<CSFD4FadePlate, MainHeapAllocator>; 9],
     unk58: u32,
