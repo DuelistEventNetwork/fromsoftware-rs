@@ -71,6 +71,18 @@ class = "CS::CSGemGaitemIns"
 vftable = "csgem_gaitem_ins_vmt"
 
 [[vmts]]
+class = "CS::CSGemSlot"
+vftable = "csgem_slot_vmt"
+
+[[vmts]]
+class = "CS::CSGemSlotTable"
+vftable = "csgem_slot_table_vmt"
+
+[[vmts]]
+class = "CS::CSProGaitemIns"
+vftable = "cspro_gaitem_ins_vmt"
+
+[[vmts]]
 class = "CS::CSModelIns"
 vftable = "csmodel_ins_vmt"
 

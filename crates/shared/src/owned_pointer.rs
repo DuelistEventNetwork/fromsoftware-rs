@@ -54,6 +54,19 @@ use crate::{GameAllocator, NoOpAllocator, Subclass, Superclass};
 /// code has a destroy method, it should be called from [Drop::drop]; otherwise,
 /// the implementation of [Drop::drop] should drop these fields in reverse
 /// declaration order.
+///
+/// ### Storing a subclass as its superclass
+///
+/// There's intentionally no way to construct an `OwnedPtr<T>` from an
+/// arbitrary pointer — every `OwnedPtr` is created by actually allocating
+/// and writing a value of a known type, so its invariants can't be bypassed
+/// by handing it someone else's pointer. When `T` is a C++ superclass and
+/// the value to store is actually one of its subclasses (for example, to
+/// build a homogeneous collection that holds instances of several different
+/// subclasses), use [`OwnedPtr::new_subclass`] rather than casting a pointer
+/// by hand: it allocates memory sized for the concrete subclass and relies
+/// on [`Subclass`]'s own layout guarantee to soundly store the result as
+/// `T`.
 #[repr(transparent)]
 pub struct OwnedPtr<T, A: GameAllocator = NoOpAllocator> {
     ptr: NonNull<T>,

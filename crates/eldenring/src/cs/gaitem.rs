@@ -1,14 +1,16 @@
 use std::fmt::Display;
 
 use bitfield::bitfield;
+use pelite::pe64::Pe;
 use thiserror::Error;
 
 use crate::{
-    cs::{CSRandXorshift, OptionalItemId},
+    cs::{CSRandXorshift, ItemCategory, ItemId, OptionalItemId},
     dlkr::MainHeapAllocator,
     dlut::DLFixedVector,
+    rva,
 };
-use shared::{OwnedPtr, Subclass, Superclass};
+use shared::{OwnedPtr, Program, Subclass, Superclass};
 
 #[repr(C)]
 #[shared::singleton("CSGaitem")]
@@ -54,11 +56,218 @@ impl CSGaitemImp {
 
         Some(self.gaitems[index].as_mut()?.as_mut())
     }
+
+    /// The number of free slots currently available in the gaitem pool, i.e.
+    /// how many more indexed [`GaitemHandle`]s (Weapon/Protector/Gem) can be
+    /// checked out via [`allocate_indexed_gaitem`](Self::allocate_indexed_gaitem)
+    /// before it's exhausted.
+    ///
+    /// Because the pool's free list is a ring buffer that only distinguishes
+    /// "empty" from "not empty" by comparing `read_index`/`write_index`
+    /// (see [`checkout_bare_handle`](Self::checkout_bare_handle)), at most
+    /// 5119 of the 5120 total slots can ever be free at once — one slot's
+    /// worth of the ring is always unrepresentable as free.
+    pub fn free_slot_count(&self) -> u32 {
+        (self.write_index + 5120 - self.read_index) % 5120
+    }
+
+    /// Reserves a free slot in the gaitem pool for `category` and returns a
+    /// [`GaitemHandle`] pointing at it, without constructing a backing
+    /// [`CSGaitemIns`] yet. Returns `None` if the pool is exhausted.
+    ///
+    /// Mirrors `CheckoutBareGaitemHandle`.
+    fn checkout_bare_handle(&mut self, category: GaitemCategory) -> Option<GaitemHandle> {
+        if self.read_index == self.write_index {
+            return None;
+        }
+
+        let index = self.indexes[self.read_index as usize];
+        self.read_index = (self.read_index + 1) % 5120;
+
+        let selector = self.gaitem_descriptors[index as usize].unindexed_gaitem_handle & 0xffffff;
+        let handle = GaitemHandle::from_parts(selector, category);
+        self.gaitem_descriptors[index as usize].unindexed_gaitem_handle = handle.0;
+        Some(handle)
+    }
+
+    /// Returns a slot to the free pool and clears its descriptor. Mirrors the
+    /// free-list push performed by `RemoveCSGaitemIns`.
+    fn free_slot(&mut self, index: u32) {
+        self.gaitems[index as usize] = None;
+        self.gaitem_descriptors[index as usize] = CSGaitemImpEntry {
+            unindexed_gaitem_handle: 0,
+            ref_count: 0,
+        };
+        self.indexes[self.write_index as usize] = index;
+        self.write_index = (self.write_index + 1) % 5120;
+    }
+
+    /// Allocates and registers a [`CSGaitemIns`]-family instance of the
+    /// correct concrete type for `category`, on the game's main heap,
+    /// returning a [`GaitemHandle`] with a starting ref count of 1.
+    ///
+    /// Only valid for [`GaitemCategory::Weapon`], [`GaitemCategory::Protector`],
+    /// and [`GaitemCategory::Gem`] — the categories backed by a real instance.
+    /// Mirrors `GetGaItemHandleWeapon`/`GetGaItemHandleProtector`/`GetGaItemHandleGem`.
+    pub fn allocate_indexed_gaitem(&mut self, item_id: ItemId) -> Option<GaitemHandle> {
+        let category = match item_id.category() {
+            ItemCategory::Weapon => GaitemCategory::Weapon,
+            ItemCategory::Protector => GaitemCategory::Protector,
+            ItemCategory::Gem => GaitemCategory::Gem,
+            _ => return None,
+        };
+
+        let handle = self.checkout_bare_handle(category)?;
+        let index = handle.index() as usize;
+
+        let base = CSGaitemIns {
+            vftable: 0,
+            gaitem_handle: handle,
+            item_id: OptionalItemId::from(item_id.into_inner()),
+        };
+
+        // Each subclass's vftable is set up front, before allocating, since
+        // `OwnedPtr::new_subclass` takes the value by move and only hands
+        // back an `OwnedPtr<CSGaitemIns, _>` afterward, which can no longer
+        // see the concrete type to fix up its vftable field.
+        let stored = match category {
+            GaitemCategory::Weapon => OwnedPtr::new_subclass(CSWepGaitemIns {
+                gaitem_ins: CSGaitemIns {
+                    vftable: CSWepGaitemIns::vmt_va() as usize,
+                    ..base
+                },
+                durability: 0,
+                reinforcement_param_id: 0,
+                gem_slot_table: CSGemSlotTable {
+                    vtable: csgem_slot_table_vmt(),
+                    gem_slots: [CSGemSlot {
+                        vtable: csgem_slot_vmt(),
+                        gaitem_handle: GaitemHandle(0),
+                    }],
+                },
+            }),
+            GaitemCategory::Protector => OwnedPtr::new_subclass(CSProGaitemIns {
+                gaitem_ins: CSGaitemIns {
+                    vftable: CSProGaitemIns::vmt_va() as usize,
+                    ..base
+                },
+                durability: 0,
+                reinforcement: 0,
+            }),
+            GaitemCategory::Gem => OwnedPtr::new_subclass(CSGemGaitemIns {
+                gaitem_ins: CSGaitemIns {
+                    vftable: CSGemGaitemIns::vmt_va() as usize,
+                    ..base
+                },
+                weapon_handle: GaitemHandle(0),
+            }),
+            _ => unreachable!(),
+        };
+        self.gaitems[index] = Some(stored);
+
+        self.gaitem_descriptors[index].ref_count = 1;
+        Some(handle)
+    }
+
+    /// Builds a [`GaitemHandle`] for a non-indexed category
+    /// ([`GaitemCategory::Goods`] or [`GaitemCategory::Accessory`]), which
+    /// isn't backed by a [`CSGaitemIns`] and requires no heap allocation.
+    ///
+    /// Mirrors `GetGaItemHandleGoods`/`GetGaItemHandleAccessory` via
+    /// `MakeBareGaitemHandle`.
+    pub fn allocate_partial_gaitem(&self, category: GaitemCategory, param_id: u32) -> GaitemHandle {
+        GaitemHandle::from_parts(param_id, category)
+    }
+
+    /// Increments the ref count of the [`CSGaitemIns`] backing `handle`. A
+    /// no-op for non-indexed handles or the null handle.
+    ///
+    /// Mirrors `IncreaseGaitemHandleRefCount`.
+    pub fn increase_ref_count(&mut self, handle: GaitemHandle) {
+        if !handle.is_indexed() || handle.0 == 0 {
+            return;
+        }
+
+        let index = handle.index() as usize;
+        if index >= self.gaitem_descriptors.len() {
+            return;
+        }
+
+        if self.gaitem_descriptors[index].unindexed_gaitem_handle == handle.0 {
+            self.gaitem_descriptors[index].ref_count += 1;
+        }
+    }
+
+    /// Releases a reference to the [`CSGaitemIns`] backing `handle`,
+    /// deallocating it and freeing its slot back to the pool if this was the
+    /// last reference. A no-op for non-indexed handles or the null handle.
+    ///
+    /// Mirrors `CS::GaItemImp::RemoveHandle`.
+    pub fn release_handle(&mut self, handle: GaitemHandle) {
+        if !handle.is_indexed() || handle.0 == 0 {
+            return;
+        }
+
+        let index = handle.index() as usize;
+        if index >= self.gaitem_descriptors.len() {
+            return;
+        }
+
+        if self.gaitem_descriptors[index].unindexed_gaitem_handle != handle.0 {
+            return;
+        }
+
+        if self.gaitem_descriptors[index].ref_count < 2 {
+            self.gaitem_descriptors[index].ref_count = 0;
+            self.free_slot(index as u32);
+        } else {
+            self.gaitem_descriptors[index].ref_count -= 1;
+        }
+    }
+
+    /// Overwrites `*slot` with `new_handle`, correctly adjusting ref counts
+    /// on both the old and new handle (incrementing the new one first, then
+    /// releasing the old one). A no-op if `*slot == new_handle`.
+    ///
+    /// **Any write to a [`GaitemHandle`] field that might already hold a
+    /// live handle (an inventory entry, a `ChrAsm` equip slot, ...) must go
+    /// through this method rather than a bare assignment**, or it will leak
+    /// the old handle's `CSGaitemIns` allocation and ref count.
+    ///
+    /// Mirrors `swapInventoryItemGaItemHandles_`.
+    pub fn swap_handle(&mut self, slot: &mut GaitemHandle, new_handle: GaitemHandle) {
+        if *slot == new_handle {
+            return;
+        }
+
+        self.increase_ref_count(new_handle);
+        self.release_handle(*slot);
+        *slot = new_handle;
+    }
+}
+
+/// The VA of `CS::CSGemSlotTable`'s vtable.
+///
+/// `CSGemSlotTable` doesn't derive [`Subclass`], since it isn't a subclass of
+/// [`CSGaitemIns`], so its vtable is looked up directly by RVA instead of
+/// through [`Subclass::vmt_va`].
+fn csgem_slot_table_vmt() -> usize {
+    Program::current()
+        .rva_to_va(rva::get().csgem_slot_table_vmt)
+        .expect("csgem_slot_table_vmt RVA not found in executable") as usize
+}
+
+/// The VA of `CS::CSGemSlot`'s vtable. See [`csgem_slot_table_vmt`] for why
+/// this is looked up directly rather than through [`Subclass::vmt_va`].
+fn csgem_slot_vmt() -> usize {
+    Program::current()
+        .rva_to_va(rva::get().csgem_slot_vmt)
+        .expect("csgem_slot_vmt RVA not found in executable") as usize
 }
 
 #[repr(C)]
 #[derive(Superclass)]
-#[superclass(children(CSWepGaitemIns, CSGemGaitemIns))]
+#[superclass(children(CSWepGaitemIns, CSGemGaitemIns, CSProGaitemIns))]
 pub struct CSGaitemIns {
     vftable: usize,
     pub gaitem_handle: GaitemHandle,
@@ -192,6 +401,16 @@ pub struct CSGemGaitemIns {
     pub gaitem_ins: CSGaitemIns,
     /// Handle of the weapon this gem is attached to
     pub weapon_handle: GaitemHandle,
+}
+
+#[repr(C)]
+#[derive(Subclass)]
+pub struct CSProGaitemIns {
+    pub gaitem_ins: CSGaitemIns,
+    /// Item durability mechanic. Unused in ER.
+    pub durability: u32,
+    /// Reinforcement mechanic. Unused in ER.
+    pub reinforcement: u32,
 }
 
 #[repr(C)]

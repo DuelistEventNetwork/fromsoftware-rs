@@ -188,6 +188,37 @@ impl ItemId {
         self.0.into_inner()
     }
 
+    /// For a [Weapon](ItemCategory::Weapon) ID, returns its reinforcement
+    /// (upgrade) level, 0–25. Weapon param rows are laid out as
+    /// `base_param_id * 100 + level`, so this is simply [param_id](Self::param_id)
+    /// modulo 100 — confirmed against real weapon IDs and their independently
+    /// known upgrade levels (e.g. a param ID ending in `...24` is level 24).
+    ///
+    /// The result is meaningless for any other category; callers must check
+    /// [category](Self::category) first.
+    pub fn weapon_upgrade_level(&self) -> u32 {
+        self.param_id() % 100
+    }
+
+    /// For a [Weapon](ItemCategory::Weapon) ID, returns the param ID of the
+    /// unupgraded (+0) row for this ID's specific affinity/infusion — the
+    /// same rounding [SoloParamRepository::get_equip_param] uses to look up
+    /// [EquipParamWeapon](crate::param::EQUIP_PARAM_WEAPON_ST) rows, which
+    /// only exist at these +0 IDs.
+    ///
+    /// **This is not the same as the weapon's plain/Standard-infusion base
+    /// ID** (what the build-planner API calls `weapon_hex_id`) unless this
+    /// ID's affinity already is Standard — each affinity occupies its own
+    /// contiguous block of 100 param rows (one per reinforcement level), so
+    /// e.g. a Heavy-infused weapon's `base_weapon_param_id()` lands on the
+    /// Heavy block's +0 row, a different (and higher, at least for Heavy)
+    /// param ID than the Standard block's +0 row.
+    ///
+    /// [SoloParamRepository::get_equip_param]: crate::cs::SoloParamRepository::get_equip_param
+    pub fn base_weapon_param_id(&self) -> u32 {
+        (self.param_id() / 100) * 100
+    }
+
     pub fn as_optional(&self) -> &OptionalItemId {
         &self.0
     }
@@ -232,7 +263,7 @@ impl fmt::Debug for ItemId {
 
 #[cfg(test)]
 mod tests {
-    use crate::cs::{ItemCategory, OptionalItemId};
+    use crate::cs::{ItemCategory, ItemId, OptionalItemId};
 
     #[test]
     fn test_bitfield() {
@@ -247,5 +278,40 @@ mod tests {
         item = OptionalItemId(u32::MAX);
         assert_eq!(item.param_id(), None);
         assert_eq!(item.category(), None);
+    }
+
+    #[test]
+    fn weapon_upgrade_level_and_base_id() {
+        // A real +24 Heavy Grave Scythe, full_hex_id 0x0122124C, fetched
+        // from the build-planner Integration API and cross-checked against
+        // its independently-reported upgrade level of 24.
+        let plus_24 = ItemId::try_from(0x0122124C).unwrap();
+        assert_eq!(plus_24.weapon_upgrade_level(), 24);
+        // 0x0122124C's affinity/Heavy block's +0 row is affinity_hex_id
+        // 0x01221234 (also confirmed against the same API response) — not
+        // weapon_hex_id (0x012211D0, the Standard block's +0 row), since
+        // affinities each occupy their own 100-row block.
+        assert_eq!(plus_24.base_weapon_param_id(), 19010100);
+        assert_eq!(
+            ItemId::try_from(0x01221234).unwrap().param_id(),
+            plus_24.base_weapon_param_id()
+        );
+
+        // The same weapon at +25 (0x0122124D = one higher) lands on the same
+        // affinity block's +0 row.
+        let plus_25 = ItemId::try_from(0x0122124D).unwrap();
+        assert_eq!(plus_25.weapon_upgrade_level(), 25);
+        assert_eq!(plus_25.base_weapon_param_id(), 19010100);
+
+        // weapon_hex_id (0x012211D0, this weapon's Standard/plain block) is
+        // a *different* affinity block, 100 rows below — its own +0 row is
+        // itself, not the Heavy block's.
+        let standard_base = ItemId::try_from(0x012211D0).unwrap();
+        assert_eq!(standard_base.weapon_upgrade_level(), 0);
+        assert_eq!(standard_base.base_weapon_param_id(), 19010000);
+        assert_ne!(
+            standard_base.base_weapon_param_id(),
+            plus_24.base_weapon_param_id()
+        );
     }
 }

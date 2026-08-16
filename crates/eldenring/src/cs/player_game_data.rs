@@ -7,12 +7,16 @@ use thiserror::Error;
 use crate::dlkr::MainHeapAllocator;
 use crate::{
     ArrayWithHeader, DLList, DLVector,
-    cs::{ChrType, MultiplayRole, QuickmatchDesiredTeam},
+    cs::{ChrType, EquipParamGoods, EquipParamWeapon, MultiplayRole, QuickmatchDesiredTeam},
     from_net::FNVector,
 };
-use shared::{IsEmpty, MaybeEmpty, NonEmptyIteratorExt, NonEmptyIteratorMutExt, OwnedPtr};
+use shared::{
+    FromStatic, IsEmpty, MaybeEmpty, NonEmptyIteratorExt, NonEmptyIteratorMutExt, OwnedPtr,
+};
 
-use crate::cs::{FieldInsHandle, GaitemHandle, ItemId, OptionalItemId};
+use crate::cs::{
+    FieldInsHandle, GaitemHandle, ItemCategory, ItemId, OptionalItemId, SoloParamRepository,
+};
 
 #[repr(C)]
 /// Source of name: RTTI
@@ -902,6 +906,142 @@ impl InventoryItemsData {
         let (_, cur_idx) = self.find_chain_entry(item_id)?;
         Some(self.mapping_entry(cur_idx)?.mapping.item_slot() as u32)
     }
+
+    /// Finds the first empty slot in the key items array, scanning up to its
+    /// full capacity (not just its current length). Returns the slot's
+    /// **offset within the key items array** (not a global inventory slot
+    /// index), or `None` if there's no empty slot.
+    ///
+    /// Mirrors the scan in `InsertKeyItem`.
+    fn find_empty_key_offset(&self) -> Option<u32> {
+        let entries = unsafe {
+            std::slice::from_raw_parts(
+                self.key_items_head.as_ptr(),
+                self.key_items_capacity as usize,
+            )
+        };
+        entries.iter().position(|e| e.is_empty()).map(|i| i as u32)
+    }
+
+    /// Finds the first empty slot in the normal items array, scanning up to
+    /// its full capacity (not just its current length, unlike
+    /// [normal_entries_mut](Self::normal_entries_mut)). Returns the slot's
+    /// **offset within the normal items array** (not a global inventory slot
+    /// index), or `None` if there's no empty slot.
+    ///
+    /// Mirrors the scan in `InsertNormalItem`.
+    fn find_empty_normal_offset(&self) -> Option<u32> {
+        self.normal_entries()
+            .iter()
+            .position(|e| e.is_empty())
+            .map(|i| i as u32)
+    }
+
+    /// The number of empty slots in the key items array, scanning up to its
+    /// full capacity (not just its current length). This is how many more
+    /// distinct key-item entries can be inserted before it's full.
+    pub fn empty_key_slot_count(&self) -> u32 {
+        let entries = unsafe {
+            std::slice::from_raw_parts(
+                self.key_items_head.as_ptr(),
+                self.key_items_capacity as usize,
+            )
+        };
+        entries.iter().filter(|e| e.is_empty()).count() as u32
+    }
+
+    /// The number of empty slots in the normal items array, scanning up to
+    /// its full capacity (not just its current length, unlike
+    /// [normal_entries_mut](Self::normal_entries_mut)). This is how many more
+    /// distinct normal-item entries can be inserted before it's full.
+    pub fn empty_normal_slot_count(&self) -> u32 {
+        self.normal_entries()
+            .iter()
+            .filter(|e| e.is_empty())
+            .count() as u32
+    }
+
+    /// Writes `entry` into the first empty key-item or normal-item slot
+    /// (per `is_key_item`), and registers it in the item ID lookup table.
+    /// Returns the global inventory slot index the entry was written to, or
+    /// `None` if there's no free slot.
+    ///
+    /// `key_items_len`/`normal_items_len` are always incremented by exactly
+    /// one on a successful insert (mirroring `InsertKeyItem`/
+    /// `InsertNormalItem`'s unconditional `count += 1`), *before* writing the
+    /// entry, since [`entry_at_slot_mut`](Self::entry_at_slot_mut) can only
+    /// reach slots within the current length.
+    ///
+    /// Mirrors `InsertKeyItem`/`InsertNormalItem`.
+    pub fn insert_entry(
+        &mut self,
+        entry: EquipInventoryDataListEntry,
+        is_key_item: bool,
+    ) -> Option<u32> {
+        let item_id = entry.item_id;
+
+        let global_slot = if is_key_item {
+            let offset = self.find_empty_key_offset()?;
+            self.key_items_len += 1;
+            unsafe {
+                *self.key_items_accessor.length.as_mut() = self.key_items_len;
+            }
+            offset
+        } else {
+            let offset = self.find_empty_normal_offset()?;
+            self.normal_items_len += 1;
+            self.key_items_capacity + offset
+        };
+
+        let slot = self.entry_at_slot_mut(global_slot)?;
+        *slot = MaybeEmpty::new(entry);
+
+        self.update_item_id_mapping(item_id, global_slot as i16);
+        Some(global_slot)
+    }
+
+    /// Clears the entry at `slot`, removing it from the item ID lookup table
+    /// and decrementing the relevant length by exactly one (mirroring
+    /// `RemoveItemEntryBySlot`'s unconditional `count -= 1`, regardless of
+    /// whether `slot` was actually the highest occupied one — over any
+    /// sequence of inserts/removes each taking the first free slot, this
+    /// keeps the length equal to the true occupied-entry count). Returns the
+    /// [`GaitemHandle`] the cleared entry held, if any, so the caller can
+    /// release it via
+    /// [`CSGaitemImp::release_handle`](crate::cs::CSGaitemImp::release_handle).
+    ///
+    /// Mirrors `RemoveItemEntryBySlot`.
+    pub fn remove_entry(&mut self, slot: u32) -> Option<GaitemHandle> {
+        let entry = self.entry_at_slot_mut(slot)?;
+        let (item_id, gaitem_handle) = entry.as_option().map(|e| (e.item_id, e.gaitem_handle))?;
+
+        // Safety: `EquipInventoryDataListEntry`'s `IsEmpty` impl considers an
+        // entry empty solely based on whether its `item_id` field (the `u32`
+        // at offset 4, following the `GaitemHandle` bitfield) equals
+        // `OptionalItemId::NONE`. Writing that value directly is the
+        // documented way to produce a well-known-empty `MaybeEmpty<T>`
+        // without needing a "no item" value of `T` itself, which `ItemId`
+        // can't represent (it's always a valid item by construction).
+        unsafe {
+            entry
+                .as_non_null()
+                .cast::<u32>()
+                .add(1)
+                .write(OptionalItemId::NONE.into_inner());
+        }
+
+        if slot < self.key_items_capacity {
+            self.key_items_len -= 1;
+            unsafe {
+                *self.key_items_accessor.length.as_mut() = self.key_items_len;
+            }
+        } else {
+            self.normal_items_len -= 1;
+        }
+
+        self.remove_item_id_mapping(item_id);
+        Some(gaitem_handle)
+    }
 }
 
 #[repr(C)]
@@ -926,6 +1066,248 @@ pub struct EquipInventoryData {
     unk122: u8,
     unk123: u8,
     unk124: u32,
+}
+
+/// Weapon category value for arrows, the only weapon-category items that
+/// stack. Source: `EQUIP_PARAM_WEAPON_ST::weapon_category`.
+const WEAPON_CATEGORY_ARROW: u8 = 0xd;
+/// Weapon category value for bolts, the only other weapon-category items
+/// that stack. Source: `EQUIP_PARAM_WEAPON_ST::weapon_category`.
+const WEAPON_CATEGORY_BOLT: u8 = 0xe;
+
+impl EquipInventoryData {
+    /// Whether `item_id` stacks (has a quantity greater than 1 in a single
+    /// inventory entry) rather than occupying one entry per copy. True for
+    /// all Goods, and for Weapons in the arrow/bolt categories.
+    ///
+    /// Mirrors `IsStackable`.
+    pub fn is_stackable(item_id: ItemId) -> bool {
+        match item_id.category() {
+            ItemCategory::Goods => true,
+            ItemCategory::Weapon => {
+                let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+                    return false;
+                };
+                let Some(weapon) = repo.get::<EquipParamWeapon>((item_id.param_id() / 100) * 100)
+                else {
+                    return false;
+                };
+                matches!(
+                    weapon.weapon_category(),
+                    WEAPON_CATEGORY_ARROW | WEAPON_CATEGORY_BOLT
+                )
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `item_id` is a unique key item: a Goods item the player can
+    /// only ever hold one copy of.
+    ///
+    /// Mirrors `IsKeyItem`.
+    pub fn is_key_item(item_id: ItemId) -> bool {
+        if item_id.category() != ItemCategory::Goods {
+            return false;
+        }
+        let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+            return false;
+        };
+        repo.get::<EquipParamGoods>(item_id.param_id())
+            .map(|goods| goods.is_only_one())
+            .unwrap_or(false)
+    }
+
+    /// The maximum quantity a single inventory entry of `item_id` can hold.
+    ///
+    /// For Goods, this is the pot-group remaining capacity if the item is
+    /// part of a limited pot group and [limited_pots](Self::limited_pots) is
+    /// set, otherwise `EQUIP_PARAM_GOODS_ST::max_num` (or 99 if unset),
+    /// overridden to a large amount if
+    /// [unlimited_consumables](Self::unlimited_consumables) is set. For
+    /// arrow/bolt Weapons, this is `EQUIP_PARAM_WEAPON_ST::max_arrow_quantity`.
+    /// Returns 0 for anything else.
+    ///
+    /// Mirrors `GetMaxAmountForItem`/`GetMaxQuantityForItemEntry`.
+    pub fn max_stack_for(&self, item_id: ItemId) -> u32 {
+        let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+            return 0;
+        };
+
+        match item_id.category() {
+            ItemCategory::Goods => {
+                if self.unlimited_consumables {
+                    return 600;
+                }
+
+                let Some(goods) = repo.get::<EquipParamGoods>(item_id.param_id()) else {
+                    return 0;
+                };
+
+                let pot_group = goods.pot_group_id();
+                if pot_group >= 0 {
+                    if self.limited_pots {
+                        return self.pot_items_capacity[pot_group as usize]
+                            .saturating_sub(self.pot_items_count[pot_group as usize]);
+                    }
+                    return 99;
+                }
+
+                if goods.max_num() > 0 {
+                    goods.max_num() as u32
+                } else {
+                    99
+                }
+            }
+            ItemCategory::Weapon => {
+                let Some(weapon) = repo.get::<EquipParamWeapon>((item_id.param_id() / 100) * 100)
+                else {
+                    return 0;
+                };
+                if matches!(
+                    weapon.weapon_category(),
+                    WEAPON_CATEGORY_ARROW | WEAPON_CATEGORY_BOLT
+                ) {
+                    weapon.max_arrow_quantity() as u32
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
+    }
+
+    /// Gives `quantity` more of the stackable item `item_id`, merging into an
+    /// existing entry if present or creating a new one otherwise, clamped to
+    /// [max_stack_for](Self::max_stack_for). Returns the quantity actually
+    /// added, which may be less than `quantity` (including 0) if the stack or
+    /// inventory is full — unlike the game, this never spawns a world item
+    /// drop for any remainder.
+    ///
+    /// `item_id` must be [is_stackable](Self::is_stackable). `gaitem_handle`
+    /// is only used when creating a new entry (the existing entry's handle is
+    /// reused when merging), and its ref count isn't adjusted by this method.
+    ///
+    /// Mirrors `AddInventoryEquip`'s stackable branch and
+    /// `AdjustQuantityBy`/`GetAddOrRemoveAmount`.
+    pub fn give_stackable(
+        &mut self,
+        item_id: ItemId,
+        quantity: u32,
+        gaitem_handle: GaitemHandle,
+    ) -> u32 {
+        if quantity == 0 {
+            return 0;
+        }
+
+        let max = self.max_stack_for(item_id);
+
+        if let Some(slot) = self.items_data.find_item_idx(item_id) {
+            let Some(entry) = self
+                .items_data
+                .entry_at_slot_mut(slot)
+                .and_then(|e| e.as_option_mut())
+            else {
+                return 0;
+            };
+
+            let added = max.saturating_sub(entry.quantity).min(quantity);
+            entry.quantity += added;
+
+            if added > 0 {
+                let pot_group = entry.pot_group;
+                if pot_group >= 0 {
+                    self.pot_items_count[pot_group as usize] += added;
+                }
+            }
+
+            added
+        } else {
+            let added = max.min(quantity);
+            if added == 0 {
+                return 0;
+            }
+
+            let pot_group = Self::pot_group_for(item_id);
+            let sort_id = self.next_sort_id;
+            self.next_sort_id += 1;
+
+            let is_key_item = Self::is_key_item(item_id);
+            let inserted = self.items_data.insert_entry(
+                EquipInventoryDataListEntry {
+                    gaitem_handle,
+                    item_id,
+                    quantity: added,
+                    sort_id,
+                    is_new: true,
+                    pot_group,
+                },
+                is_key_item,
+            );
+
+            if inserted.is_none() {
+                return 0;
+            }
+
+            if pot_group >= 0 {
+                self.pot_items_count[pot_group as usize] += added;
+            }
+
+            added
+        }
+    }
+
+    /// Removes up to `quantity` of the stackable item `item_id`, clearing its
+    /// entry (via [`InventoryItemsData::remove_entry`]) if the stack reaches
+    /// zero. Returns the quantity actually removed and, if the entry was
+    /// cleared, the [`GaitemHandle`] it held so the caller can release it.
+    ///
+    /// Mirrors the negative-quantity branch of `GetAddOrRemoveAmount` and
+    /// `AdjustItemCountByIndex`.
+    pub fn take_stackable(
+        &mut self,
+        item_id: ItemId,
+        quantity: u32,
+    ) -> (u32, Option<GaitemHandle>) {
+        let Some(slot) = self.items_data.find_item_idx(item_id) else {
+            return (0, None);
+        };
+        let Some(entry) = self
+            .items_data
+            .entry_at_slot_mut(slot)
+            .and_then(|e| e.as_option_mut())
+        else {
+            return (0, None);
+        };
+
+        let removed = quantity.min(entry.quantity);
+        let pot_group = entry.pot_group;
+        entry.quantity -= removed;
+
+        if pot_group >= 0 && removed > 0 {
+            self.pot_items_count[pot_group as usize] =
+                self.pot_items_count[pot_group as usize].saturating_sub(removed);
+        }
+
+        if entry.quantity == 0 {
+            let handle = self.items_data.remove_entry(slot);
+            (removed, handle)
+        } else {
+            (removed, None)
+        }
+    }
+
+    /// The pot group of `item_id`, or -1 if it's not part of one.
+    fn pot_group_for(item_id: ItemId) -> i32 {
+        if item_id.category() != ItemCategory::Goods {
+            return -1;
+        }
+        let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+            return -1;
+        };
+        repo.get::<EquipParamGoods>(item_id.param_id())
+            .map(|goods| goods.pot_group_id() as i32)
+            .unwrap_or(-1)
+    }
 }
 
 bitfield! {
