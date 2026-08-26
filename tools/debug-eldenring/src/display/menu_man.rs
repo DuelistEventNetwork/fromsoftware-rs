@@ -1,3 +1,4 @@
+use fromsoftware_shared::FromStatic;
 use hudhook::imgui::{TableColumnSetup, Ui};
 
 use debug::UiExt;
@@ -6,7 +7,7 @@ use eldenring::cs::{
     CSPopupMenu, FeSystemAnnounceView, LoadingScreenData, MenuString, SystemAnnounceViewModelState,
     UIState,
 };
-use eldenring::dlkr::DLAllocator;
+use eldenring::dlkr::MenuHeapAllocator;
 use eldenring::dltx::DLString;
 
 use crate::display::{DebugDisplay, DisplayUiExt, StatefulDebugDisplay};
@@ -59,10 +60,8 @@ impl StatefulDebugDisplay for CSMenuManImp {
             ui.input_text("", &mut state.new_announcement).build();
             ui.same_line();
             if ui.button("Push Announcement")
-                && let Ok(text) = DLString::from_str(
-                    &state.new_announcement,
-                    DLAllocator::runtime_heap_allocator(),
-                )
+                && let Some(allocator) = unsafe { MenuHeapAllocator::instance() }.ok()
+                && let Ok(text) = DLString::from_str(&state.new_announcement, allocator)
             {
                 self.system_announce_view_model
                     .notifications
@@ -85,10 +84,8 @@ impl StatefulDebugDisplay for CSMenuManImp {
                 ui.input_text("", &mut state.new_popup_message).build();
                 ui.same_line();
                 if ui.button("Push Popup Message")
-                    && let Ok(text) = DLString::from_str(
-                        &state.new_popup_message,
-                        DLAllocator::runtime_heap_allocator(),
-                    )
+                    && let Some(allocator) = unsafe { MenuHeapAllocator::instance() }.ok()
+                    && let Ok(text) = DLString::from_str(&state.new_popup_message, allocator)
                 {
                     popup_menu.popup_messages.push_back(MenuString {
                         static_string: std::ptr::null(),

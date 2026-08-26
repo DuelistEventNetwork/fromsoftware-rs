@@ -11,15 +11,17 @@ use crate::{
 use bitfield::bitfield;
 
 #[repr(C)]
-/// Entry in the weapon upgrade index map.
-/// Maps different param row indices to their parent/child/sibling relation for the weapon upgrade levels.
+/// Entry in the weapon index map.
+///
+/// Relates a weapon's param rows to the rest of its affinity
+/// and variant rows as a parent/child/sibling tree.
 pub struct WeaponUpgradeIndexMapEntry {
-    /// Index to the base weapon param id upgrade param row.
+    /// Index of this row's parent, or -1 at the root of the family.
     pub parent: i16,
-    /// Index to the next sibling param row.
+    /// Index of the next row in this node's sibling list, or -1 at the end.
     pub next_sibling: i16,
-    /// Index to the first child param row.
-    /// -1 if not a parent.
+    /// Index of the first of this row's children, or -1 if it has none.
+    /// Children are a weapon's variants, not its next upgrade level.
     pub first_child: i16,
 }
 
@@ -36,15 +38,15 @@ pub struct CSWepReinforceTree {
 }
 
 impl CSWepReinforceTree {
-    /// Get the next upgrade param row index for the given weapon param row index.
-    pub fn get_next_upgrade(&self, weapon_param_row_index: usize) -> Option<usize> {
+    /// The next row in this node's sibling list, if any.
+    pub fn get_next_sibling(&self, weapon_param_row_index: usize) -> Option<usize> {
         // Safety: index_map is guaranteed to be valid.
         let upgrade_list = unsafe { self.index_map.as_slice() };
-        let next_index = upgrade_list[weapon_param_row_index].first_child;
-        if next_index == -1 {
+        let next_sibling = upgrade_list[weapon_param_row_index].next_sibling;
+        if next_sibling == -1 {
             None
         } else {
-            Some(next_index as usize)
+            Some(next_sibling as usize)
         }
     }
     /// Get the base weapon param row index for the given weapon param row index.
@@ -376,6 +378,45 @@ impl SoloParamRepository {
     /// type and ID.
     pub fn get_index_by_param_id<P: SoloParam>(&self, param_id: u32) -> Option<usize> {
         self.get_param_file::<P>().find_index(param_id)
+    }
+
+    /// The highest reinforcement level `param_id`'s weapon can reach.
+    ///
+    /// `param_id` is normalized to its `+0` row, so any level of a weapon
+    /// gives the same answer. `None` if the weapon has no row at all.
+    pub fn max_reinforce_level(&self, param_id: u32) -> Option<u32> {
+        let base_param_id = (param_id / 100) * 100;
+        let weapon = self.get::<EquipParamWeapon>(base_param_id)?;
+
+        let levels = [
+            weapon.origin_equip_wep1(),
+            weapon.origin_equip_wep2(),
+            weapon.origin_equip_wep3(),
+            weapon.origin_equip_wep4(),
+            weapon.origin_equip_wep5(),
+            weapon.origin_equip_wep6(),
+            weapon.origin_equip_wep7(),
+            weapon.origin_equip_wep8(),
+            weapon.origin_equip_wep9(),
+            weapon.origin_equip_wep10(),
+            weapon.origin_equip_wep11(),
+            weapon.origin_equip_wep12(),
+            weapon.origin_equip_wep13(),
+            weapon.origin_equip_wep14(),
+            weapon.origin_equip_wep15(),
+            weapon.origin_equip_wep16(),
+            weapon.origin_equip_wep17(),
+            weapon.origin_equip_wep18(),
+            weapon.origin_equip_wep19(),
+            weapon.origin_equip_wep20(),
+            weapon.origin_equip_wep21(),
+            weapon.origin_equip_wep22(),
+            weapon.origin_equip_wep23(),
+            weapon.origin_equip_wep24(),
+            weapon.origin_equip_wep25(),
+        ];
+
+        Some(levels.into_iter().take_while(|origin| *origin >= 0).count() as u32)
     }
 
     /// Returns an equipment parameter row enum for the given item ID, or `None`

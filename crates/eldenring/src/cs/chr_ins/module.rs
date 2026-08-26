@@ -12,6 +12,7 @@ mod ladder;
 mod material;
 mod model_param_modifier;
 mod physics;
+mod resist;
 mod ride;
 mod super_armor;
 mod throw;
@@ -31,6 +32,7 @@ pub use ladder::*;
 pub use material::*;
 pub use model_param_modifier::*;
 pub use physics::*;
+pub use resist::*;
 pub use ride::*;
 pub use super_armor::*;
 pub use throw::*;
@@ -46,7 +48,7 @@ pub struct ChrInsModuleContainer {
     pub action_flag: OwnedPtr<CSChrActionFlagModule, MainHeapAllocator>,
     behavior_script: OwnedPtr<(), MainHeapAllocator>,
     pub time_act: OwnedPtr<CSChrTimeActModule, MainHeapAllocator>,
-    resist: OwnedPtr<(), MainHeapAllocator>,
+    pub resist: OwnedPtr<CSChrResistModule, MainHeapAllocator>,
     pub behavior: OwnedPtr<CSChrBehaviorModule, MainHeapAllocator>,
     behavior_sync: OwnedPtr<(), MainHeapAllocator>,
     ai: OwnedPtr<(), MainHeapAllocator>,

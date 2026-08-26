@@ -77,6 +77,29 @@ where
     }
 }
 
+impl<T> MaybeEmpty<T>
+where
+    T: IsEmpty + Default,
+{
+    /// Resets this to its type's "empty" state, dropping whatever value it
+    /// currently holds.
+    ///
+    /// Available for any [IsEmpty] type that can also express its empty state
+    /// as a [Default] value — [is_empty](Self::is_empty) must return true for
+    /// `T::default()`. Note that a type's empty pattern may need to clear
+    /// *several* fields, not just the one [is_empty](Self::is_empty)
+    /// inspects: the game can test emptiness differently in different places,
+    /// and every field it uses to do so has to agree.
+    pub fn clear(&mut self) {
+        *self = MaybeEmpty::new(T::default());
+        debug_assert!(
+            self.is_empty(),
+            "{}'s Default value must satisfy its own IsEmpty impl",
+            std::any::type_name::<T>(),
+        );
+    }
+}
+
 impl<T> fmt::Debug for MaybeEmpty<T>
 where
     T: IsEmpty + fmt::Debug,

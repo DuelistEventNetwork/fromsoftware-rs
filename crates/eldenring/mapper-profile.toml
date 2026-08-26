@@ -251,6 +251,10 @@ class = "CS::SoloParamRepositoryImp"
 vftable = "solo_param_repository_vmt"
 
 [[patterns]]
+captures = ["", "broadcast_equipment_change"]
+pattern = "74 ? 48 8d 4c 24 30 e8 $ {'} 48 83 c4 28"
+
+[[patterns]]
 pattern = "48 8d 05 $ { ' } 48 89 4f 68 88 4f 70 48 89 4f 78 48 89 07 48 8b 43 18"
 captures = ["", "fd4file_cap_vmt"]
 

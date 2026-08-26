@@ -4,11 +4,12 @@ use hudhook::imgui::{TableColumnSetup, Ui};
 
 use debug::UiExt;
 use eldenring::cs::{
-    ChrAsm, ChrAsmEquipEntries, ChrAsmEquipment, ChrAsmSlot, ChrIns, ChrInsExt, ChrInsSubclassMut,
-    EquipGameData, EquipInventoryData, EquipItemData, EquipMagicData, InventoryItemsData,
-    ItemReplenishStateTracker, PlayerDataAttackRating, PlayerGameData, PlayerIns,
+    CSGaitemImp, ChrAsm, ChrAsmEquipEntries, ChrAsmEquipment, ChrAsmSlot, ChrIns, ChrInsExt,
+    ChrInsSubclassMut, EquipGameData, EquipInventoryData, EquipInventoryDataListEntry,
+    EquipItemData, EquipMagicData, InventoryItemsData, ItemReplenishStateTracker,
+    PlayerDataAttackRating, PlayerGameData, PlayerIns,
 };
-use fromsoftware_shared::NonEmptyIteratorExt;
+use fromsoftware_shared::{FromStatic, MaybeEmpty, NonEmptyIteratorExt};
 
 use crate::display::{DebugDisplay, DisplayUiExt, StatefulDebugDisplay};
 
@@ -41,52 +42,63 @@ impl StatefulDebugDisplay for PlayerIns {
 impl DebugDisplay for ChrAsm {
     fn render_debug(&self, ui: &Ui) {
         ui.nested("ChrAsmEquipment", &self.equipment);
-        ui.header("GaitemHandles", || {
+
+        // One row per slot, with the handle resolved through `CSGaitemImp`
+        // rather than shown raw. Each equipped slot is really three values
+        // that have to agree — the handle here, the param id beside it, and
+        // the gaitem the handle points at — and `equip_slot` writes all three
+        // from one inventory entry. When they disagree, the slot is holding a
+        // stale or misresolved reference, which is exactly what a weapon
+        // appearing in a protector slot looks like.
+        //
+        // "Gaitem Item ID" is what the pool actually holds for that handle;
+        // "Param ID" is what `ChrAsm` recorded. Those two are written
+        // together and should always match.
+        let gaitem = unsafe { CSGaitemImp::instance() }.ok();
+
+        ui.header("Equipped slots", || {
             ui.table(
-                "chr-asm-gaitem-handles",
+                "chr-asm-equipped-slots",
                 [
                     TableColumnSetup::new("Index"),
                     TableColumnSetup::new("Slot"),
                     TableColumnSetup::new("Gaitem Handle"),
-                ],
-                self.gaitem_handles.iter(),
-                |ui, i, e| {
-                    ui.table_next_column();
-                    ui.text(format!("{i}"));
-
-                    ui.table_next_column();
-                    match ChrAsmSlot::from_index(i as u32) {
-                        Ok(slot) => ui.text(format!("{slot:?}")),
-                        Err(err) => ui.text(err.to_string()),
-                    }
-
-                    ui.table_next_column();
-                    ui.text(e.to_string());
-                },
-            );
-        });
-
-        ui.header("Param IDs", || {
-            ui.table(
-                "chr-asm-param-ids",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Slot"),
+                    TableColumnSetup::new("Gaitem Item ID"),
                     TableColumnSetup::new("Param ID"),
                 ],
-                self.equipment_param_ids.iter(),
-                |ui, i, e| {
+                self.gaitem_handles
+                    .iter()
+                    .zip(self.equipment_param_ids.iter())
+                    .enumerate(),
+                |ui, _, (index, (handle, param_id))| {
                     ui.table_next_column();
-                    ui.text(format!("{i}"));
+                    ui.text(index.to_string());
 
                     ui.table_next_column();
-                    match ChrAsmSlot::from_index(i as u32) {
+                    match ChrAsmSlot::from_index(index as u32) {
                         Ok(slot) => ui.text(format!("{slot:?}")),
                         Err(err) => ui.text(err.to_string()),
                     }
 
                     ui.table_next_column();
-                    ui.text(e.to_string());
+                    ui.text(handle.to_string());
+
+                    ui.table_next_column();
+                    if handle.0 == 0 {
+                        ui.text("<empty>");
+                    } else if !handle.is_indexed() {
+                        // Goods/Accessory handles are bare — no pool entry
+                        // backs them, so there's nothing to resolve.
+                        ui.text("<not indexed>");
+                    } else {
+                        match gaitem.and_then(|g| g.gaitem_ins_by_handle(handle)) {
+                            Some(ins) => ui.text(format!("{:?}", ins.item_id)),
+                            None => ui.text("<unresolved>"),
+                        }
+                    }
+
+                    ui.table_next_column();
+                    ui.text(param_id.to_string());
                 },
             );
         });
@@ -116,39 +128,39 @@ impl DebugDisplay for ChrAsmEquipment {
 
 impl DebugDisplay for ChrAsmEquipEntries {
     fn render_debug(&self, ui: &Ui) {
-        ui.debug("Primary Left weapon", self.weapon_primary_left.param_id());
-        ui.debug("Primary Right weapon", self.weapon_primary_right.param_id());
-        ui.debug(
-            "Secondary Left weapon",
-            self.weapon_secondary_left.param_id(),
-        );
-        ui.debug(
-            "Secondary Right weapon",
-            self.weapon_secondary_right.param_id(),
-        );
-        ui.debug("Tertiary Left weapon", self.weapon_tertiary_left.param_id());
-        ui.debug(
-            "Tertiary Right weapon",
-            self.weapon_tertiary_right.param_id(),
-        );
+        // Indexed by `ChrAsmSlot`, in the same order as
+        // `ChrAsm::gaitem_handles` — the two are written together by
+        // `equip_slot`, so this table lines up row-for-row with `ChrAsm`'s
+        // and any disagreement between them is a half-applied equip.
+        //
+        // Ids are shown whole rather than through `param_id()`, since the
+        // category nibble is what distinguishes e.g. a Protector from a
+        // Weapon and is exactly what goes wrong when an id is built or
+        // stored incorrectly.
+        ui.header("Slots", || {
+            ui.table(
+                "chr-asm-equip-entries-slots",
+                [
+                    TableColumnSetup::new("Index"),
+                    TableColumnSetup::new("Slot"),
+                    TableColumnSetup::new("Item ID"),
+                ],
+                (0..22u32).filter_map(|index| {
+                    let slot = ChrAsmSlot::from_index(index).ok()?;
+                    Some((index, slot, self[slot]))
+                }),
+                |ui, _, (index, slot, item_id)| {
+                    ui.table_next_column();
+                    ui.text(index.to_string());
 
-        ui.debug("Primary Left arrow", self.arrow_primary.param_id());
-        ui.debug("Primary Left bolt", self.bolt_primary.param_id());
-        ui.debug("Secondary Left arrow", self.arrow_secondary.param_id());
-        ui.debug("Secondary Left bolt", self.bolt_secondary.param_id());
-        ui.debug("Tertiary Left arrow", self.arrow_tertiary.param_id());
-        ui.debug("Tertiary Left bolt", self.bolt_tertiary.param_id());
+                    ui.table_next_column();
+                    ui.text(format!("{slot:?}"));
 
-        ui.debug("Protector Head", self.protector_head.param_id());
-        ui.debug("Protector Chest", self.protector_chest.param_id());
-        ui.debug("Protector Hands", self.protector_hands.param_id());
-        ui.debug("Protector Legs", self.protector_legs.param_id());
-
-        ui.list("Accessories", self.accessories.iter(), |ui, i, item| {
-            ui.text(format!("{}: {:?}", i, item));
+                    ui.table_next_column();
+                    ui.text(format!("{item_id:?}"));
+                },
+            );
         });
-
-        ui.text(format!("Covenant: {:?}", self.covenant.param_id()));
 
         ui.list("Quick Items", self.quick_tems.iter(), |ui, index, item| {
             ui.text(format!("{}: {:?}", index, item));
@@ -393,6 +405,119 @@ impl DebugDisplay for PlayerDataAttackRating {
 
 impl DebugDisplay for EquipGameData {
     fn render_debug(&self, ui: &Ui) {
+        ui.display("Is main player", self.is_main_player);
+        ui.debug("Last add item result", self.last_add_item_result);
+        ui.debug("Broken equipment slots", self.broken_equipment_slots);
+
+        ui.nested("ChrAsm", &self.chr_asm);
+
+        // The fourth array `equip_slot` writes, alongside
+        // `chr_asm.gaitem_handles`, `chr_asm.equipment_param_ids` and
+        // `equipment_entries` — it maps each `ChrAsmSlot` back to the global
+        // inventory slot the equipped item lives in, and `u32::MAX` means
+        // nothing equipped. "Resolves To" is what that inventory slot
+        // actually holds now, so a row whose resolved item disagrees with
+        // the same slot in `ChrAsm` is pointing at a stale entry.
+        ui.header("Equipment Item Index List", || {
+            ui.table(
+                "equip-game-data-equipment-item-idx-list",
+                [
+                    TableColumnSetup::new("Index"),
+                    TableColumnSetup::new("Slot"),
+                    TableColumnSetup::new("Inventory Slot"),
+                    TableColumnSetup::new("Resolves To"),
+                    TableColumnSetup::new("Consistent"),
+                ],
+                self.equipment_item_idx_list.iter().enumerate(),
+                |ui, _, (index, inventory_slot)| {
+                    ui.table_next_column();
+                    ui.text(index.to_string());
+
+                    let slot = ChrAsmSlot::from_index(index as u32);
+
+                    ui.table_next_column();
+                    match &slot {
+                        Ok(slot) => ui.text(format!("{slot:?}")),
+                        Err(err) => ui.text(err.to_string()),
+                    }
+
+                    ui.table_next_column();
+                    if *inventory_slot == u32::MAX {
+                        ui.text("<none>");
+                    } else {
+                        ui.text(inventory_slot.to_string());
+                    }
+
+                    ui.table_next_column();
+                    if *inventory_slot == u32::MAX {
+                        ui.text("<none>");
+                    } else {
+                        ui.text(resolved_slot_item(
+                            &self.equip_inventory_data,
+                            *inventory_slot as i32,
+                        ));
+                    }
+
+                    // All three of `equipment_entries`, the equipped gaitem
+                    // handle, and the entry `equipment_item_idx_list` names
+                    // are written from one inventory slot by
+                    // `SetEquipmentEntries`/`ChrAsm::EquipItem`, so none of
+                    // them can legitimately disagree. The gaitem handle is
+                    // checked too, not just the id: a slot whose entries and
+                    // index agree can still hold a handle belonging to a
+                    // completely different item, which is invisible if only
+                    // the ids are compared.
+                    ui.table_next_column();
+                    match slot {
+                        Ok(slot) => {
+                            let entry = self.equipment_entries[slot].as_valid();
+                            let inventory_entry = (*inventory_slot != u32::MAX)
+                                .then(|| {
+                                    self.equip_inventory_data
+                                        .items_data
+                                        .entry_at_slot(*inventory_slot)
+                                        .and_then(|e| e.as_option())
+                                })
+                                .flatten();
+                            let resolved = inventory_entry.and_then(|e| e.item_id.as_valid());
+
+                            let equipped_handle = self.chr_asm.gaitem_handles[slot as usize];
+                            let entry_handle = inventory_entry.map(|e| e.gaitem_handle);
+
+                            let mut problems = Vec::new();
+                            if entry != resolved {
+                                problems
+                                    .push(format!("entries={entry:?} idx_list->{resolved:?}"));
+                            }
+                            if let Some(entry_handle) = entry_handle
+                                && entry_handle != equipped_handle
+                            {
+                                problems.push(format!(
+                                    "handle={equipped_handle:?} entry has {entry_handle:?}"
+                                ));
+                            }
+
+                            if problems.is_empty() {
+                                ui.text("ok");
+                            } else {
+                                ui.text(format!("MISMATCH {}", problems.join("; ")));
+                            }
+                        }
+                        Err(_) => ui.text("-"),
+                    }
+                },
+            );
+        });
+
+        ui.nested("Equipment Entries", &self.equipment_entries);
+
+        ui.header("Physick Tears", || {
+            ui.list("Tears", self.physick_tears.iter(), |ui, i, tear| {
+                ui.text(format!("{i}: {tear:?}"));
+            });
+            ui.debug("Extra tear", self.extra_physick_tear);
+        });
+
         ui.nested("EquipInventoryData", &self.equip_inventory_data);
         ui.nested("EquipMagicData", &self.equip_magic_data);
         ui.nested("EquipItemData", &self.equip_item_data);
@@ -484,71 +609,175 @@ impl DebugDisplay for EquipItemData {
     fn render_debug(&self, ui: &Ui) {
         ui.display("Selected quick slot", self.selected_quick_slot);
 
-        ui.header("Quick slots", || {
-            ui.table(
-                "equip-item-data-quick-slots",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Gaitem Handle"),
-                    TableColumnSetup::new("Inventory Index"),
-                ],
-                self.quick_slots.iter(),
-                |ui, index, item| {
-                    ui.table_next_column();
-                    ui.text(index.to_string());
-                    ui.align_text_to_frame_padding();
+        let inventory = unsafe { self.inventory.as_ref() };
+        let entries = unsafe { self.equip_entries.as_ref() };
 
-                    ui.table_next_column();
-                    ui.text(item.gaitem_handle.to_string());
+        // Each of these slots is a *pair*: an `EquipDataItem` (gaitem handle +
+        // inventory slot) here, and the mirrored item id in
+        // `ChrAsmEquipEntries`. The two must agree, and the inventory slot
+        // must still hold the item the handle refers to.
+        //
+        // `CS::EquipGameData::RemoveItem` clears both halves of any slot
+        // pointing at a removed entry (`FUN_140250060` for quick,
+        // `FUN_140250100` for pouch, `FUN_140250030` for the great rune).
+        // Skip that and the index goes on pointing at whatever later reuses
+        // the slot — which the UI then renders in place of the real item.
+        // "Resolves to" below is what the inventory actually holds at that
+        // index right now, so a mismatch against "Mirrored ID" is a stale
+        // reference.
+        equip_data_item_table(
+            ui,
+            "Quick slots",
+            "equip-item-data-quick-slots",
+            &self.quick_slots,
+            &entries.quick_tems,
+            inventory,
+        );
 
-                    ui.table_next_column();
-                    ui.text(item.index.to_string());
-                },
+        equip_data_item_table(
+            ui,
+            "Pouch slots",
+            "equip-item-data-pouch-slots",
+            &self.pouch_slots,
+            &entries.pouch,
+            inventory,
+        );
+
+        ui.header("Great rune", || {
+            ui.display("Gaitem handle", self.great_rune.gaitem_handle.to_string());
+            ui.display("Inventory slot", self.great_rune.index);
+            ui.display(
+                "Resolves to",
+                resolved_slot_item(inventory, self.great_rune.index),
             );
         });
 
-        ui.header("Pouch slots", || {
-            ui.table(
-                "equip-item-data-pouch-slots",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Gaitem Handle"),
-                    TableColumnSetup::new("Inventory Index"),
-                ],
-                self.pouch_slots.iter(),
-                |ui, index, item| {
-                    ui.table_next_column();
-                    ui.text(index.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.gaitem_handle.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.index.to_string());
-                },
-            );
-        });
-
-        ui.text(format!(
-            "Greatrune: {}, index: {}",
-            self.great_rune.gaitem_handle, self.great_rune.index
-        ));
-
-        ui.nested("Equipment Entries", &self.equip_entries);
-        ui.display("Selected Quick Slot", self.selected_quick_slot);
+        // Same object `EquipGameData` renders directly — shown again here
+        // because reaching it through this back-pointer is what proves the
+        // pointer is still valid.
+        ui.nested("Equipment Entries (via back-pointer)", entries);
     }
+}
+
+/// What the inventory currently holds at global slot `index`, for
+/// cross-checking a stored slot reference against reality.
+fn resolved_slot_item(inventory: &EquipInventoryData, index: i32) -> String {
+    let Ok(slot) = u32::try_from(index) else {
+        return "<none>".to_string();
+    };
+
+    match inventory
+        .items_data
+        .entry_at_slot(slot)
+        .and_then(|entry| entry.as_option())
+    {
+        Some(entry) => format!("{:?}", entry.item_id),
+        None => "<empty slot>".to_string(),
+    }
+}
+
+/// Renders a quick-slot or pouch table alongside its mirrored ids, so the two
+/// halves of each slot can be compared at a glance.
+fn equip_data_item_table(
+    ui: &Ui,
+    label: &str,
+    id: &str,
+    slots: &[eldenring::cs::EquipDataItem],
+    mirrored: &[eldenring::cs::OptionalItemId],
+    inventory: &EquipInventoryData,
+) {
+    let gaitem = unsafe { CSGaitemImp::instance() }.ok();
+
+    ui.header(label, || {
+        ui.table(
+            id,
+            [
+                TableColumnSetup::new("Slot"),
+                TableColumnSetup::new("Gaitem Handle"),
+                TableColumnSetup::new("Gaitem Item ID"),
+                TableColumnSetup::new("Inventory Slot"),
+                TableColumnSetup::new("Resolves To"),
+                TableColumnSetup::new("Mirrored ID"),
+            ],
+            slots.iter().enumerate(),
+            |ui, _, (index, item)| {
+                ui.table_next_column();
+                ui.text(index.to_string());
+
+                ui.table_next_column();
+                ui.text(item.gaitem_handle.to_string());
+
+                ui.table_next_column();
+                if item.gaitem_handle.0 == 0 {
+                    ui.text("<empty>");
+                } else if !item.gaitem_handle.is_indexed() {
+                    ui.text("<not indexed>");
+                } else {
+                    match gaitem.and_then(|g| g.gaitem_ins_by_handle(&item.gaitem_handle)) {
+                        Some(ins) => ui.text(format!("{:?}", ins.item_id)),
+                        None => ui.text("<unresolved>"),
+                    }
+                }
+
+                ui.table_next_column();
+                ui.text(item.index.to_string());
+
+                ui.table_next_column();
+                ui.text(resolved_slot_item(inventory, item.index));
+
+                ui.table_next_column();
+                match mirrored.get(index) {
+                    Some(id) => ui.text(format!("{id:?}")),
+                    None => ui.text("<out of range>"),
+                }
+            },
+        );
+    });
 }
 
 impl DebugDisplay for EquipInventoryData {
     fn render_debug(&self, ui: &Ui) {
         ui.nested("InventoryItemsData", &self.items_data);
-        ui.display("Total item entry count", self.total_item_entry_count);
+
+        // Bounds several of the game's own scans (`GetQuantityByItemId`,
+        // `AdjustQuantityBy`, `GetInventoryItemEntryByIndex` all walk
+        // `0..=highest_item_slot`), so an entry past it is present in memory
+        // but invisible to them. Raised by `InsertItem`, and lowered by one
+        // by `EquipInventoryData::RemoveItem` only when the removed slot is
+        // exactly this one — an upper bound, not a tight maximum.
+        ui.display("Highest item slot", self.highest_item_slot);
         ui.display("Next sort ID", self.next_sort_id);
         ui.display("Unlimited Consumables", self.unlimited_consumables);
         ui.display("Limited Consumables", self.limited_pots);
 
+        ui.header("Pot Groups", || {
+            ui.table(
+                "equip-inventory-data-pot-groups",
+                [
+                    TableColumnSetup::new("Group"),
+                    TableColumnSetup::new("Count"),
+                    TableColumnSetup::new("Capacity"),
+                ],
+                self.pot_items_count
+                    .iter()
+                    .zip(self.pot_items_capacity.iter())
+                    .enumerate()
+                    .filter(|(_, (count, capacity))| **count != 0 || **capacity != 0),
+                |ui, _, (group, (count, capacity))| {
+                    ui.table_next_column();
+                    ui.text(group.to_string());
+
+                    ui.table_next_column();
+                    ui.text(count.to_string());
+
+                    ui.table_next_column();
+                    ui.text(capacity.to_string());
+                },
+            );
+        });
+
         ui.list(
-            "Recent Items Indecies",
+            "Recent Item Indices",
             self.recent_item_indices.iter(),
             |ui, i, item| {
                 ui.text(format!("{}: {:?}", i, item));
@@ -557,117 +786,137 @@ impl DebugDisplay for EquipInventoryData {
     }
 }
 
+/// Renders one inventory entry table, with **real global slot indices**
+/// rather than positions within the filtered iterator.
+///
+/// The distinction matters: a global slot is what `equipment_item_idx_list`,
+/// `EquipDataItem::index` and the item-id lookup map all store, so a table
+/// keyed by anything else can't be cross-referenced against them. Normal
+/// items start at `key_items_capacity`, key items at 0.
+fn inventory_entry_table(
+    ui: &Ui,
+    id: &str,
+    entries: &[MaybeEmpty<EquipInventoryDataListEntry>],
+    first_slot: u32,
+) {
+    // "Gaitem Item ID" resolves the entry's handle through `CSGaitemImp` and
+    // should always match the entry's own "Item ID" — the two are written
+    // together when the entry is created. A mismatch means the handle points
+    // at a pool slot that's since been reused, and `<unresolved>` means it
+    // points at nothing at all.
+    let gaitem = unsafe { CSGaitemImp::instance() }.ok();
+
+    ui.table(
+        id,
+        [
+            TableColumnSetup::new("Slot"),
+            TableColumnSetup::new("Gaitem Handle"),
+            TableColumnSetup::new("Gaitem Item ID"),
+            TableColumnSetup::new("Item ID"),
+            TableColumnSetup::new("Quantity"),
+            TableColumnSetup::new("Sort ID"),
+            TableColumnSetup::new("Pot Group"),
+            TableColumnSetup::new("Is New"),
+        ],
+        entries
+            .iter()
+            .enumerate()
+            .filter_map(|(offset, entry)| Some((first_slot + offset as u32, entry.as_option()?))),
+        |ui, _, (slot, item)| {
+            ui.table_next_column();
+            ui.text(slot.to_string());
+
+            ui.table_next_column();
+            ui.text(item.gaitem_handle.to_string());
+
+            ui.table_next_column();
+            if !item.gaitem_handle.is_indexed() {
+                ui.text("<not indexed>");
+            } else {
+                match gaitem.and_then(|g| g.gaitem_ins_by_handle(&item.gaitem_handle)) {
+                    Some(ins) => ui.text(format!("{:?}", ins.item_id)),
+                    None => ui.text("<unresolved>"),
+                }
+            }
+
+            ui.table_next_column();
+            ui.text(format!("{:?}", item.item_id));
+
+            ui.table_next_column();
+            ui.text(item.quantity.to_string());
+
+            ui.table_next_column();
+            ui.text(item.sort_id.to_string());
+
+            ui.table_next_column();
+            ui.text(item.pot_group.to_string());
+
+            ui.table_next_column();
+            ui.text(item.is_new.to_string());
+        },
+    );
+}
+
 impl DebugDisplay for InventoryItemsData {
     fn render_debug(&self, ui: &Ui) {
-        let normal_items = self.normal_entries().iter().non_empty().collect::<Vec<_>>();
+        // `*_len` are occupancy counts, not extents — slots are sparse, so
+        // the highest occupied slot can sit well above the count. Both are
+        // shown, since a mismatch between the count and the number of rows
+        // below means the counters have drifted from reality.
+        let key_capacity = self.key_items_capacity;
+
+        let occupied_normal = self.normal_entries().iter().non_empty().count();
         let label = format!(
-            "Normal Items ({}/{})",
-            normal_items.len(),
-            self.normal_items_capacity
+            "Normal Items ({} occupied, len {}, cap {}, slots {}..)",
+            occupied_normal, self.normal_items_len, self.normal_items_capacity, key_capacity,
         );
         ui.header(&label, || {
-            ui.table(
+            inventory_entry_table(
+                ui,
                 "inventory-items-data-normal-items",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Gaitem Handle"),
-                    TableColumnSetup::new("Item ID"),
-                    TableColumnSetup::new("Quantity"),
-                    TableColumnSetup::new("Display ID"),
-                    TableColumnSetup::new("Is New"),
-                ],
-                normal_items.iter(),
-                |ui, index, item| {
-                    ui.table_next_column();
-                    ui.text(index.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.gaitem_handle.to_string());
-
-                    ui.table_next_column();
-                    ui.text(format!("{:?}", item.item_id));
-
-                    ui.table_next_column();
-                    ui.text(item.quantity.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.sort_id.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.is_new.to_string());
-                },
+                self.normal_entries(),
+                key_capacity,
             );
         });
 
+        let occupied_key = self.key_entries().iter().non_empty().count();
         let label = format!(
-            "Key Items ({}/{})",
-            self.key_items_len, self.key_items_capacity
+            "Key Items ({} occupied, len {}, cap {}, slots 0..)",
+            occupied_key, self.key_items_len, key_capacity,
         );
         ui.header(&label, || {
-            ui.table(
-                "inventory-items-data-key-items",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Gaitem Handle"),
-                    TableColumnSetup::new("Item ID"),
-                    TableColumnSetup::new("Quantity"),
-                    TableColumnSetup::new("Display ID"),
-                    TableColumnSetup::new("Is New"),
-                ],
-                self.key_entries().iter().non_empty(),
-                |ui, index, item| {
-                    ui.table_next_column();
-                    ui.text(index.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.gaitem_handle.to_string());
-
-                    ui.table_next_column();
-                    ui.text(format!("{:?}", item.item_id));
-
-                    ui.table_next_column();
-                    ui.text(item.quantity.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.sort_id.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.is_new.to_string());
-                },
-            );
+            inventory_entry_table(ui, "inventory-items-data-key-items", self.key_entries(), 0);
         });
 
+        // The accessor is what every read and write in the game actually goes
+        // through: it points at `key_items` in singleplayer and swaps to
+        // `multiplay_key_items` in multiplayer (`SwapKeyItemsAccessor`). If
+        // this doesn't match the Key Items table above, the session is in
+        // multiplayer.
+        let accessor_matches_key = std::ptr::eq(
+            self.key_entries().as_ptr(),
+            self.current_key_entries().as_ptr(),
+        );
+        ui.display(
+            "Key items accessor",
+            if accessor_matches_key {
+                "key_items (singleplayer)"
+            } else {
+                "multiplay_key_items"
+            },
+        );
+
+        let occupied_mp = self.multiplay_key_entries().iter().non_empty().count();
         let label = format!(
-            "Multiplay Key Items ({}/{})",
-            self.multiplay_key_items_len, self.multiplay_key_items_capacity
+            "Multiplay Key Items ({} occupied, len {}, cap {}, slots 0..)",
+            occupied_mp, self.multiplay_key_items_len, self.multiplay_key_items_capacity,
         );
         ui.header(&label, || {
-            ui.table(
+            inventory_entry_table(
+                ui,
                 "inventory-items-data-multiplay-key-items",
-                [
-                    TableColumnSetup::new("Index"),
-                    TableColumnSetup::new("Gaitem Handle"),
-                    TableColumnSetup::new("Item ID"),
-                    TableColumnSetup::new("Quantity"),
-                    TableColumnSetup::new("Display ID"),
-                ],
-                self.multiplay_key_entries().iter().non_empty(),
-                |ui, index, item| {
-                    ui.table_next_column();
-                    ui.text(index.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.gaitem_handle.to_string());
-
-                    ui.table_next_column();
-                    ui.text(format!("{:?}", item.item_id));
-
-                    ui.table_next_column();
-                    ui.text(item.quantity.to_string());
-
-                    ui.table_next_column();
-                    ui.text(item.sort_id.to_string());
-                },
+                self.multiplay_key_entries(),
+                0,
             );
         });
         ui.header("Item ID Map", || {

@@ -7,7 +7,10 @@ use thiserror::Error;
 use crate::dlkr::MainHeapAllocator;
 use crate::{
     ArrayWithHeader, DLList, DLVector,
-    cs::{ChrType, EquipParamGoods, EquipParamWeapon, MultiplayRole, QuickmatchDesiredTeam},
+    cs::{
+        ChrType, EquipParamGem, EquipParamGoods, EquipParamWeapon, MultiplayRole,
+        QuickmatchDesiredTeam,
+    },
     from_net::FNVector,
 };
 use shared::{
@@ -15,7 +18,8 @@ use shared::{
 };
 
 use crate::cs::{
-    FieldInsHandle, GaitemHandle, ItemCategory, ItemId, OptionalItemId, SoloParamRepository,
+    CSGaitemImp, FaceData, FieldInsHandle, GaitemHandle, ItemCategory, ItemId, OptionalItemId,
+    SoloParamRepository,
 };
 
 #[repr(C)]
@@ -274,23 +278,6 @@ pub struct PlayerDataAttackRating {
 }
 
 #[repr(C)]
-pub struct FaceData {
-    vftable: usize,
-    pub face_data_buffer: FaceDataBuffer,
-    unk128: usize,
-    unk130: [f32; 7],
-    unk14c: [u8; 0x24],
-}
-
-#[repr(C)]
-pub struct FaceDataBuffer {
-    pub magic: [u8; 4],
-    pub version: u32,
-    pub buffer_size: u32,
-    pub buffer: [u8; 276],
-}
-
-#[repr(C)]
 pub struct PlayerGameDataSpEffect {
     pub sp_effect_id: u32,
     pub duration: f32,
@@ -510,12 +497,19 @@ pub struct InventoryItemsData {
     /// A pointer to the head of the normal items inventory.
     pub normal_items_head: OwnedPtr<MaybeEmpty<EquipInventoryDataListEntry>, MainHeapAllocator>,
 
-    /// The length currently in use of the normal items inventory.
+    /// How many normal-item entries are occupied.
     ///
-    /// This isn't necessarily the number of items in the inventory. The
-    /// inventory can have gaps (such as when you pick up two items and then
-    /// discard the earlier one), and this counts those gaps as part of the
-    /// length despite not being actual items.
+    /// A count of live entries, not an extent: slots are sparse, and this
+    /// tracks occupancy across the gaps rather than the highest slot in use
+    /// (that's [`EquipInventoryData::highest_item_slot`]). `InsertNormalItem`
+    /// increments it whenever it fills an empty slot — including one *below*
+    /// the current value — and `RemoveItemEntryBySlot` decrements it for any
+    /// slot it clears.
+    ///
+    /// Nothing in the game iterates by this. Reads index the array directly
+    /// by global slot and null-check the entry
+    /// (`GetInventoryItemEntryByIndex`), so it's bookkeeping to keep
+    /// consistent rather than a bound to respect.
     pub normal_items_len: u32,
 
     /// The maximum capacity of the key items inventory.
@@ -524,12 +518,10 @@ pub struct InventoryItemsData {
     /// A pointer to the head of the key items inventory.
     pub key_items_head: OwnedPtr<MaybeEmpty<EquipInventoryDataListEntry>, MainHeapAllocator>,
 
-    /// The length currently in use of the key items inventory.
-    ///
-    /// This isn't necessarily the number of items in the inventory. The
-    /// inventory can have gaps (such as when you pick up two items and then
-    /// discard the earlier one), and this counts those gaps as part of the
-    /// length despite not being actual items.
+    /// How many key-item entries are occupied. Same semantics as
+    /// [`normal_items_len`](Self::normal_items_len) — a count of live
+    /// entries across sparse slots, not an extent, and not used as an
+    /// iteration bound by the game.
     pub key_items_len: u32,
 
     /// The maximum capacity of the multiplayer key items inventory.
@@ -537,18 +529,16 @@ pub struct InventoryItemsData {
 
     /// Holds key items that are available in multiplayer.
     ///
-    /// Unless new key items are somehow obtained in multiplayer, this only contains
-    /// copies of the items from `key_items` that have `REGENERATIVE_MATERIAL`
-    /// and `WONDROUS_PHYSICK_TEAR` types (pots and wondrous physic tears).
+    /// Populated by `SwapKeyItemsAccessor` when entering multiplayer: it
+    /// walks `key_items` and copies across every `Goods` entry whose
+    /// `goodsType` is `GREAT_RUNE`, `REGENERATIVE_MATERIAL` or
+    /// `WONDROUS_PHYSICK_TEAR` (great runes, pots and wondrous physick
+    /// tears), preserving each one's quantity and `sort_id`.
     pub multiplay_key_items_head:
         OwnedPtr<MaybeEmpty<EquipInventoryDataListEntry>, MainHeapAllocator>,
 
-    /// The length currently in use of the multiplayer key items inventory.
-    ///
-    /// This isn't necessarily the number of items in the inventory. The
-    /// inventory can have gaps (such as when you pick up two items and then
-    /// discard the earlier one), and this counts those gaps as part of the
-    /// length despite not being actual items.
+    /// How many multiplayer key-item entries are occupied. Same semantics as
+    /// [`normal_items_len`](Self::normal_items_len).
     pub multiplay_key_items_len: u32,
 
     /// Pointers to the active normal item list and its length. All inventory
@@ -629,7 +619,7 @@ impl InventoryItemsData {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.normal_items_head.as_ptr(),
-                self.normal_items_len as usize,
+                self.normal_items_capacity as usize,
             )
         }
     }
@@ -712,7 +702,7 @@ impl InventoryItemsData {
         unsafe {
             std::slice::from_raw_parts(
                 self.key_items_accessor.head.as_ptr(),
-                *self.key_items_accessor.length.as_ref() as usize,
+                self.key_items_capacity as usize,
             )
         }
     }
@@ -728,7 +718,7 @@ impl InventoryItemsData {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.key_items_accessor.head.as_ptr(),
-                *self.key_items_accessor.length.as_ref() as usize,
+                self.key_items_capacity as usize,
             )
         }
     }
@@ -778,12 +768,26 @@ impl InventoryItemsData {
     }
 
     /// Pop one entry from the free list. Returns `None` if pool is full
+    ///
+    /// The popped entry's chain field holds the *next* free entry, 1-based
+    /// with `0` meaning "no next" — so the new head is
+    /// `next_chain_idx().unwrap_or(-1)`, matching
+    /// `InsertItemIntoLookupMap`'s `((mapping >> 0xc) & 0xfff) - 1`, which
+    /// lands on `-1` for the final entry. Propagating that `None` outward
+    /// instead would abandon the pop on the last free entry and, since
+    /// `update_item_id_mapping` treats a failed pop as "give up", leave the
+    /// item absent from the lookup map while its inventory entry still
+    /// exists — invisible to `find_item_idx` and to the game's own
+    /// `GetItemInventoryIdx`.
     fn pop_free_entry(&mut self) -> Option<i16> {
         let head = self.item_id_mapping_free_head;
-        if head == -1 {
+        if head < 0 {
             return None;
         }
-        let next = unsafe { self.item_id_mapping.as_slice() }[head as usize].next_chain_idx()?;
+        let next = unsafe { self.item_id_mapping.as_slice() }
+            .get(head as usize)?
+            .next_chain_idx()
+            .unwrap_or(-1);
         self.item_id_mapping_free_head = next;
         Some(head)
     }
@@ -813,7 +817,13 @@ impl InventoryItemsData {
     ///
     /// Call this after inserting or updating any inventory entry
     pub fn update_item_id_mapping(&mut self, item_id: ItemId, inventory_slot: i16) {
-        let slot_bits = inventory_slot as u16;
+        // `item_slot` is a 12-bit field, and the game masks on both the write
+        // (`mapping | param_3 & 0xfff`) and the "keep the minimum" compare
+        // (`param_3 < (mapping & 0xfff)`). Masking here keeps the comparison
+        // below apples-to-apples: comparing a full-width value against the
+        // truncated one that's actually stored would pick the wrong winner
+        // for any slot at or above 4096.
+        let slot_bits = (inventory_slot as u16) & 0xfff;
 
         match self.find_chain_entry(item_id) {
             Some((_, cur_idx)) => {
@@ -865,11 +875,31 @@ impl InventoryItemsData {
         }
     }
 
+    /// Drops `item_id`'s lookup-map entry — but only once no slot holds it
+    /// any more.
+    ///
+    /// Inventory slots are sparse: removing one copy of an item doesn't shift
+    /// the others, and the map deliberately tracks the *lowest* slot holding
+    /// a given id (see [`update_item_id_mapping`](Self::update_item_id_mapping),
+    /// mirroring `InsertItemIntoLookupMap`'s `if (param_3 < current)` guard).
+    /// So when the copy being removed is the one the map points at, the entry
+    /// has to be repointed at the next-lowest remaining copy rather than
+    /// unlinked — otherwise every surviving copy becomes invisible to
+    /// [`find_item_idx`](Self::find_item_idx).
     pub fn remove_item_id_mapping(&mut self, item_id: ItemId) {
         let (prev_idx, cur_idx) = match self.find_chain_entry(item_id) {
             Some(pair) => pair,
             None => return,
         };
+
+        // Still owned elsewhere? Repoint at the lowest remaining slot and
+        // keep the entry linked.
+        if let Some(lowest) = self.lowest_slot_holding(item_id) {
+            if let Some(e) = self.mapping_entry_mut(cur_idx) {
+                e.mapping.set_item_slot(lowest as u16);
+            }
+            return;
+        }
 
         let next = self.mapping_entry(cur_idx).and_then(|e| e.next_chain_idx());
         let free_head = self.item_id_mapping_free_head;
@@ -900,6 +930,35 @@ impl InventoryItemsData {
         self.item_id_mapping_free_head = cur_idx;
     }
 
+    /// The lowest global slot index still holding `item_id`, scanning the
+    /// entry arrays directly rather than the lookup map.
+    ///
+    /// Used by [`remove_item_id_mapping`](Self::remove_item_id_mapping) to
+    /// decide whether an id is genuinely gone or merely lost the copy the map
+    /// happened to point at.
+    fn lowest_slot_holding(&self, item_id: ItemId) -> Option<u32> {
+        let key_cap = self.key_items_capacity;
+
+        let key = self
+            .current_key_entries()
+            .iter()
+            .position(|e| {
+                e.as_option()
+                    .is_some_and(|e| e.item_id.as_valid() == Some(item_id))
+            })
+            .map(|i| i as u32);
+
+        key.or_else(|| {
+            self.normal_entries()
+                .iter()
+                .position(|e| {
+                    e.as_option()
+                        .is_some_and(|e| e.item_id.as_valid() == Some(item_id))
+                })
+                .map(|i| key_cap + i as u32)
+        })
+    }
+
     /// O(1) lookup of an item's first inventory slot via the hash table.
     /// Returns `None` if the item is not present
     pub fn find_item_idx(&self, item_id: ItemId) -> Option<u32> {
@@ -907,10 +966,11 @@ impl InventoryItemsData {
         Some(self.mapping_entry(cur_idx)?.mapping.item_slot() as u32)
     }
 
-    /// Finds the first empty slot in the key items array, scanning up to its
-    /// full capacity (not just its current length). Returns the slot's
-    /// **offset within the key items array** (not a global inventory slot
-    /// index), or `None` if there's no empty slot.
+    /// Finds the first empty slot in the key items array, scanning its full
+    /// capacity — slots are sparse, so the first free one is often below the
+    /// highest in use. Returns the slot's **offset within the key items
+    /// array** (not a global inventory slot index), or `None` if there's no
+    /// empty slot.
     ///
     /// Mirrors the scan in `InsertKeyItem`.
     fn find_empty_key_offset(&self) -> Option<u32> {
@@ -923,11 +983,11 @@ impl InventoryItemsData {
         entries.iter().position(|e| e.is_empty()).map(|i| i as u32)
     }
 
-    /// Finds the first empty slot in the normal items array, scanning up to
-    /// its full capacity (not just its current length, unlike
-    /// [normal_entries_mut](Self::normal_entries_mut)). Returns the slot's
-    /// **offset within the normal items array** (not a global inventory slot
-    /// index), or `None` if there's no empty slot.
+    /// Finds the first empty slot in the normal items array, scanning its
+    /// full capacity — slots are sparse, so the first free one is often
+    /// below the highest in use. Returns the slot's **offset within the
+    /// normal items array** (not a global inventory slot index), or `None`
+    /// if there's no empty slot.
     ///
     /// Mirrors the scan in `InsertNormalItem`.
     fn find_empty_normal_offset(&self) -> Option<u32> {
@@ -937,9 +997,9 @@ impl InventoryItemsData {
             .map(|i| i as u32)
     }
 
-    /// The number of empty slots in the key items array, scanning up to its
-    /// full capacity (not just its current length). This is how many more
-    /// distinct key-item entries can be inserted before it's full.
+    /// The number of empty slots in the key items array, scanning its full
+    /// capacity. This is how many more distinct key-item entries can be
+    /// inserted before it's full.
     pub fn empty_key_slot_count(&self) -> u32 {
         let entries = unsafe {
             std::slice::from_raw_parts(
@@ -950,10 +1010,9 @@ impl InventoryItemsData {
         entries.iter().filter(|e| e.is_empty()).count() as u32
     }
 
-    /// The number of empty slots in the normal items array, scanning up to
-    /// its full capacity (not just its current length, unlike
-    /// [normal_entries_mut](Self::normal_entries_mut)). This is how many more
-    /// distinct normal-item entries can be inserted before it's full.
+    /// The number of empty slots in the normal items array, scanning its
+    /// full capacity. This is how many more distinct normal-item entries can
+    /// be inserted before it's full.
     pub fn empty_normal_slot_count(&self) -> u32 {
         self.normal_entries()
             .iter()
@@ -966,11 +1025,22 @@ impl InventoryItemsData {
     /// Returns the global inventory slot index the entry was written to, or
     /// `None` if there's no free slot.
     ///
-    /// `key_items_len`/`normal_items_len` are always incremented by exactly
-    /// one on a successful insert (mirroring `InsertKeyItem`/
-    /// `InsertNormalItem`'s unconditional `count += 1`), *before* writing the
-    /// entry, since [`entry_at_slot_mut`](Self::entry_at_slot_mut) can only
-    /// reach slots within the current length.
+    /// `key_items_len`/`normal_items_len` are incremented by one on a
+    /// successful insert, mirroring `InsertKeyItem`/`InsertNormalItem`'s
+    /// unconditional `count += 1` — they're occupancy counts, so this holds
+    /// even when the slot filled sits below other occupied ones.
+    ///
+    /// Takes a gaitem reference for `entry.gaitem_handle` on success, since
+    /// the new entry holds one of its own for as long as it lives — mirroring
+    /// the real `InventoryItemEntry::InventoryItemEntry`, which installs the
+    /// handle through `swapInventoryItemGaItemHandles_` (a ref-counting swap)
+    /// rather than a plain assignment. It balances the release
+    /// [`remove_entry`](Self::remove_entry) hands back; without it the gaitem
+    /// is under-referenced and gets freed out from under the still-live
+    /// entry, leaving a dangling pool slot that crashes
+    /// `CSGaitemImp::Serialize`/`Deserialize` on the next menu transition.
+    /// A no-op for the non-indexed (`Goods`/`Accessory`) handles, which
+    /// aren't refcounted.
     ///
     /// Mirrors `InsertKeyItem`/`InsertNormalItem`.
     pub fn insert_entry(
@@ -978,34 +1048,44 @@ impl InventoryItemsData {
         entry: EquipInventoryDataListEntry,
         is_key_item: bool,
     ) -> Option<u32> {
-        let item_id = entry.item_id;
+        // An entry with no item is the empty state, not something to insert.
+        let item_id = entry.item_id.as_valid()?;
+        let gaitem_handle = entry.gaitem_handle;
 
         let global_slot = if is_key_item {
-            let offset = self.find_empty_key_offset()?;
+            self.find_empty_key_offset()?
+        } else {
+            self.key_items_capacity + self.find_empty_normal_offset()?
+        };
+
+        // Write the entry before touching any counter, so a failed write
+        // can't leave the length claiming a slot that was never filled — the
+        // free-slot scans run over the full capacity, and a length that ran
+        // ahead of them would hand out an index nothing lives at.
+        let slot = self.entry_at_slot_mut(global_slot)?;
+        *slot = MaybeEmpty::new(entry);
+
+        if is_key_item {
             self.key_items_len += 1;
             unsafe {
                 *self.key_items_accessor.length.as_mut() = self.key_items_len;
             }
-            offset
         } else {
-            let offset = self.find_empty_normal_offset()?;
             self.normal_items_len += 1;
-            self.key_items_capacity + offset
-        };
-
-        let slot = self.entry_at_slot_mut(global_slot)?;
-        *slot = MaybeEmpty::new(entry);
+        }
 
         self.update_item_id_mapping(item_id, global_slot as i16);
+
+        if let Ok(gaitem) = unsafe { CSGaitemImp::instance_mut() } {
+            gaitem.increase_ref_count(gaitem_handle);
+        }
+
         Some(global_slot)
     }
 
     /// Clears the entry at `slot`, removing it from the item ID lookup table
-    /// and decrementing the relevant length by exactly one (mirroring
-    /// `RemoveItemEntryBySlot`'s unconditional `count -= 1`, regardless of
-    /// whether `slot` was actually the highest occupied one — over any
-    /// sequence of inserts/removes each taking the first free slot, this
-    /// keeps the length equal to the true occupied-entry count). Returns the
+    /// and decrementing the relevant occupancy count by one, mirroring
+    /// `RemoveItemEntryBySlot`'s unconditional `count -= 1`. Returns the
     /// [`GaitemHandle`] the cleared entry held, if any, so the caller can
     /// release it via
     /// [`CSGaitemImp::release_handle`](crate::cs::CSGaitemImp::release_handle).
@@ -1013,22 +1093,13 @@ impl InventoryItemsData {
     /// Mirrors `RemoveItemEntryBySlot`.
     pub fn remove_entry(&mut self, slot: u32) -> Option<GaitemHandle> {
         let entry = self.entry_at_slot_mut(slot)?;
-        let (item_id, gaitem_handle) = entry.as_option().map(|e| (e.item_id, e.gaitem_handle))?;
+        // `as_option` already established the entry is occupied, so its
+        // `item_id` is necessarily a valid one.
+        let (item_id, gaitem_handle) = entry
+            .as_option()
+            .and_then(|e| Some((e.item_id.as_valid()?, e.gaitem_handle)))?;
 
-        // Safety: `EquipInventoryDataListEntry`'s `IsEmpty` impl considers an
-        // entry empty solely based on whether its `item_id` field (the `u32`
-        // at offset 4, following the `GaitemHandle` bitfield) equals
-        // `OptionalItemId::NONE`. Writing that value directly is the
-        // documented way to produce a well-known-empty `MaybeEmpty<T>`
-        // without needing a "no item" value of `T` itself, which `ItemId`
-        // can't represent (it's always a valid item by construction).
-        unsafe {
-            entry
-                .as_non_null()
-                .cast::<u32>()
-                .add(1)
-                .write(OptionalItemId::NONE.into_inner());
-        }
+        entry.clear();
 
         if slot < self.key_items_capacity {
             self.key_items_len -= 1;
@@ -1048,7 +1119,22 @@ impl InventoryItemsData {
 pub struct EquipInventoryData {
     vftable: usize,
     pub items_data: InventoryItemsData,
-    pub total_item_entry_count: u32,
+    /// The highest global slot index in use, **not** a count of items —
+    /// inventory slots are sparse, and this ignores the gaps between them.
+    ///
+    /// `InsertItem` raises it to cover a newly filled slot
+    /// (`if (highestItemSlot < idx) highestItemSlot = idx;`), and
+    /// `EquipInventoryData::RemoveItem` lowers it by one — but *only* when
+    /// the slot being removed is exactly this one
+    /// (`if (idx == highestItemSlot) highestItemSlot -= 1;`), so it isn't a
+    /// true maximum after removals in the middle.
+    ///
+    /// Several of the game's own scans are bounded by it and walk
+    /// `0..=highest_item_slot`, null-checking each entry as they go
+    /// (`GetQuantityByItemId`, `AdjustQuantityBy`,
+    /// `GetInventoryItemEntryByIndex`); an entry past the mark is present in
+    /// memory but invisible to them.
+    pub highest_item_slot: u32,
     /// Next sort ID to assign to newly added items.
     /// Used to sort items by acquisition order.
     pub next_sort_id: u32,
@@ -1076,6 +1162,51 @@ const WEAPON_CATEGORY_ARROW: u8 = 0xd;
 const WEAPON_CATEGORY_BOLT: u8 = 0xe;
 
 impl EquipInventoryData {
+    /// Inserts `entry` via [`InventoryItemsData::insert_entry`], then raises
+    /// [`highest_item_slot`](Self::highest_item_slot) to cover the slot it
+    /// landed in.
+    ///
+    /// That bookkeeping is why this exists rather than callers reaching for
+    /// `items_data.insert_entry` directly: the real `InsertItem` does
+    /// `if (itemEntriesCount < fromInventoryIdx) itemEntriesCount = fromInventoryIdx;`
+    /// on every insert, and several of the game's own scans are bounded by
+    /// it (`GetQuantityByItemId` and `AdjustQuantityBy` both iterate
+    /// `idx < itemEntriesCount + 1`). Leave it stale and an entry written
+    /// past the mark is physically present but invisible to those lookups.
+    pub fn insert_entry(
+        &mut self,
+        entry: EquipInventoryDataListEntry,
+        is_key_item: bool,
+    ) -> Option<u32> {
+        let slot = self.items_data.insert_entry(entry, is_key_item)?;
+
+        if self.highest_item_slot < slot {
+            self.highest_item_slot = slot;
+        }
+
+        Some(slot)
+    }
+
+    /// Removes the entry at `slot` via
+    /// [`InventoryItemsData::remove_entry`], then lowers
+    /// [`highest_item_slot`](Self::highest_item_slot) if `slot` was the one
+    /// it pointed at.
+    ///
+    /// Mirrors `EquipInventoryData::RemoveItem`'s
+    /// `if (idx == highestItemSlot) highestItemSlot -= 1;` — note it steps
+    /// down by exactly one rather than rescanning for the next occupied
+    /// slot, so after removals the mark is an upper bound rather than a
+    /// tight maximum. Every scan it bounds null-checks each entry anyway.
+    pub fn remove_entry(&mut self, slot: u32) -> Option<GaitemHandle> {
+        let handle = self.items_data.remove_entry(slot)?;
+
+        if slot == self.highest_item_slot {
+            self.highest_item_slot = self.highest_item_slot.saturating_sub(1);
+        }
+
+        Some(handle)
+    }
+
     /// Whether `item_id` stacks (has a quantity greater than 1 in a single
     /// inventory entry) rather than occupying one entry per copy. True for
     /// all Goods, and for Weapons in the arrow/bolt categories.
@@ -1088,7 +1219,7 @@ impl EquipInventoryData {
                 let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
                     return false;
                 };
-                let Some(weapon) = repo.get::<EquipParamWeapon>((item_id.param_id() / 100) * 100)
+                let Some(weapon) = repo.get::<EquipParamWeapon>(item_id.base_weapon_param_id())
                 else {
                     return false;
                 };
@@ -1133,12 +1264,14 @@ impl EquipInventoryData {
             return 0;
         };
 
+        // `GetMaxAmountForItem` tests this *before* dispatching on category,
+        // so the override covers every item, not just Goods.
+        if self.unlimited_consumables {
+            return self.unlimited_consumables_max_stack(item_id);
+        }
+
         match item_id.category() {
             ItemCategory::Goods => {
-                if self.unlimited_consumables {
-                    return 600;
-                }
-
                 let Some(goods) = repo.get::<EquipParamGoods>(item_id.param_id()) else {
                     return 0;
                 };
@@ -1176,6 +1309,41 @@ impl EquipInventoryData {
         }
     }
 
+    /// The stack ceiling under
+    /// [`unlimited_consumables`](Self::unlimited_consumables), which is what
+    /// the storage box sets.
+    ///
+    /// Mirrors `GetMaxItemCountForUnlimitedConsumables` (`0x1406748c0`).
+    /// Despite the name it isn't a blanket "unlimited": each category answers
+    /// differently, and only ammo and Goods stack meaningfully.
+    fn unlimited_consumables_max_stack(&self, item_id: ItemId) -> u32 {
+        let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
+            return 0;
+        };
+
+        match item_id.category() {
+            // Ammo stacks to 600 here; any other weapon is one per entry.
+            ItemCategory::Weapon => repo
+                .get::<EquipParamWeapon>((item_id.param_id() / 100) * 100)
+                .filter(|weapon| {
+                    matches!(
+                        weapon.weapon_category(),
+                        WEAPON_CATEGORY_ARROW | WEAPON_CATEGORY_BOLT
+                    )
+                })
+                .map_or(1, |_| 600),
+            // `maxRepositoryNum`, the item's own storage-box ceiling, not a
+            // flat 600 — that value just happens to be what most rows carry.
+            ItemCategory::Goods => repo
+                .get::<EquipParamGoods>(item_id.param_id())
+                .map_or(99, |goods| goods.max_repository_num() as u32),
+            ItemCategory::Gem => repo
+                .get::<EquipParamGem>(item_id.param_id())
+                .map_or(0, |_| 1),
+            ItemCategory::Protector | ItemCategory::Accessory => 1,
+        }
+    }
+
     /// Gives `quantity` more of the stackable item `item_id`, merging into an
     /// existing entry if present or creating a new one otherwise, clamped to
     /// [max_stack_for](Self::max_stack_for). Returns the quantity actually
@@ -1189,6 +1357,72 @@ impl EquipInventoryData {
     ///
     /// Mirrors `AddInventoryEquip`'s stackable branch and
     /// `AdjustQuantityBy`/`GetAddOrRemoveAmount`.
+    /// How many more of `item_id` can actually be added, accounting for what's
+    /// already held.
+    ///
+    /// [`max_stack_for`](Self::max_stack_for) answers two different questions
+    /// depending on the item, matching `GetMaxAmountForItem` (`0x14024e570`):
+    /// for a pot-group item under `limited_pots` it already returns the
+    /// group's *remaining headroom*, while for everything else it returns a
+    /// per-entry *stack ceiling*. Subtracting the entry's own quantity is
+    /// therefore right for the latter and wrong for the former — a pot group's
+    /// budget is shared across all its items, so its count has already been
+    /// deducted.
+    ///
+    /// `slot` is the entry the quantity would be added to, or `None` when the
+    /// item isn't held yet.
+    pub fn headroom_for(&self, item_id: ItemId, slot: Option<u32>) -> u32 {
+        let max = self.max_stack_for(item_id);
+
+        if self.limited_pots && Self::pot_group_for(item_id) >= 0 {
+            // Already headroom — do not deduct the entry's quantity again.
+            return max;
+        }
+
+        let held = slot
+            .and_then(|slot| self.items_data.entry_at_slot(slot))
+            .and_then(|entry| entry.as_option())
+            .map(|entry| entry.quantity)
+            .unwrap_or(0);
+
+        max.saturating_sub(held)
+    }
+
+    /// Adds `quantity` to the stack already held at `slot`, capped at the
+    /// item's maximum stack size. Returns how many were actually added.
+    ///
+    /// Mirrors `EquipInventoryData::AdjustQuantityBy`, the branch
+    /// `AddInventoryEquip` takes for a stackable item that's already owned —
+    /// no new inventory entry, and no new gaitem, since the existing entry's
+    /// handle continues to back the whole stack.
+    pub fn add_to_stack(&mut self, item_id: ItemId, slot: u32, quantity: u32) -> u32 {
+        if quantity == 0 {
+            return 0;
+        }
+
+        let headroom = self.headroom_for(item_id, Some(slot));
+
+        let Some(entry) = self
+            .items_data
+            .entry_at_slot_mut(slot)
+            .and_then(|e| e.as_option_mut())
+        else {
+            return 0;
+        };
+
+        let added = headroom.min(quantity);
+        entry.quantity += added;
+
+        if added > 0 {
+            let pot_group = entry.pot_group;
+            if pot_group >= 0 {
+                self.pot_items_count[pot_group as usize] += added;
+            }
+        }
+
+        added
+    }
+
     pub fn give_stackable(
         &mut self,
         item_id: ItemId,
@@ -1199,9 +1433,8 @@ impl EquipInventoryData {
             return 0;
         }
 
-        let max = self.max_stack_for(item_id);
-
         if let Some(slot) = self.items_data.find_item_idx(item_id) {
+            let headroom = self.headroom_for(item_id, Some(slot));
             let Some(entry) = self
                 .items_data
                 .entry_at_slot_mut(slot)
@@ -1210,7 +1443,7 @@ impl EquipInventoryData {
                 return 0;
             };
 
-            let added = max.saturating_sub(entry.quantity).min(quantity);
+            let added = headroom.min(quantity);
             entry.quantity += added;
 
             if added > 0 {
@@ -1222,7 +1455,7 @@ impl EquipInventoryData {
 
             added
         } else {
-            let added = max.min(quantity);
+            let added = self.headroom_for(item_id, None).min(quantity);
             if added == 0 {
                 return 0;
             }
@@ -1232,10 +1465,10 @@ impl EquipInventoryData {
             self.next_sort_id += 1;
 
             let is_key_item = Self::is_key_item(item_id);
-            let inserted = self.items_data.insert_entry(
+            let inserted = self.insert_entry(
                 EquipInventoryDataListEntry {
                     gaitem_handle,
-                    item_id,
+                    item_id: item_id.into(),
                     quantity: added,
                     sort_id,
                     is_new: true,
@@ -1289,7 +1522,7 @@ impl EquipInventoryData {
         }
 
         if entry.quantity == 0 {
-            let handle = self.items_data.remove_entry(slot);
+            let handle = self.remove_entry(slot);
             (removed, handle)
         } else {
             (removed, None)
@@ -1376,7 +1609,10 @@ pub struct EquipInventoryDataListEntry {
     /// Handle to the gaitem instance which describes additional properties to the inventory item,
     /// like durability and gems in the case of weapons.
     pub gaitem_handle: GaitemHandle,
-    pub item_id: ItemId,
+    /// The item this entry holds, or [`OptionalItemId::NONE`] when the entry
+    /// is empty — the state [`MaybeEmpty`] keys on, and the reason this is an
+    /// [`OptionalItemId`] rather than an [`ItemId`].
+    pub item_id: OptionalItemId,
     /// Quantity of the item we have.
     pub quantity: u32,
     /// Sort ID used to sort items by acquisition order.
@@ -1392,8 +1628,44 @@ pub struct EquipInventoryDataListEntry {
 
 unsafe impl IsEmpty for EquipInventoryDataListEntry {
     fn is_empty(value: &MaybeEmpty<EquipInventoryDataListEntry>) -> bool {
-        !OptionalItemId::from(unsafe { *value.as_non_null().cast::<u32>().offset(1).as_ref() })
-            .is_valid()
+        // Safety: `item_id` is `OptionalItemId`, which is valid for every bit
+        // pattern, so it's readable whether or not the entry is occupied.
+        !unsafe { value.as_non_null().as_ref() }.item_id.is_valid()
+    }
+}
+
+impl EquipInventoryDataListEntry {
+    /// This entry's item, or `None` if the entry is empty.
+    ///
+    /// Entries reached through [`items`](InventoryItemsData::items) or
+    /// [`MaybeEmpty::as_option`] are always occupied, so this returns `Some`
+    /// for them.
+    pub fn item(&self) -> Option<ItemId> {
+        self.item_id.as_valid()
+    }
+}
+
+impl Default for EquipInventoryDataListEntry {
+    /// An empty entry: a null `gaitem_handle` and a `NONE` `item_id`.
+    ///
+    /// Both fields matter, because the game tests emptiness two different
+    /// ways depending on the code path: `RebuildLookupMapping` skips entries
+    /// whose `itemId` is `-1`, while `InsertKeyItem`/`InsertNormalItem`
+    /// search for a free slot using `InventoryItemEntry::IsGaItemHandleNull`
+    /// (`gaItemHandle == 0`). Clearing only one leaves a slot that's
+    /// invisible to the lookup map but permanently unavailable for
+    /// insertion, still carrying a dangling gaitem handle — which the game
+    /// then picks up when it rebuilds state from these arrays on a menu
+    /// transition.
+    fn default() -> Self {
+        Self {
+            gaitem_handle: GaitemHandle(0),
+            item_id: OptionalItemId::NONE,
+            quantity: 0,
+            sort_id: 0,
+            is_new: false,
+            pot_group: -1,
+        }
     }
 }
 
@@ -1478,6 +1750,44 @@ pub enum ChrAsmSlotError {
 }
 
 impl ChrAsmSlot {
+    /// Whether an item of `category` can be equipped into this slot.
+    ///
+    /// Weapon slots take `Weapon` (arrow/bolt slots included — ammo is
+    /// `Weapon`-category, distinguished by `weaponCategory` rather than by
+    /// item category), protector slots take `Protector`, and accessory slots
+    /// take `Accessory`. `Goods` and `Gem` have no `ChrAsmSlot` at all: goods
+    /// live in quick/pouch slots on `EquipItemData`, and gems are mounted
+    /// into a weapon's gem slot.
+    pub fn accepts(self, category: ItemCategory) -> bool {
+        match self {
+            ChrAsmSlot::WeaponLeft1
+            | ChrAsmSlot::WeaponRight1
+            | ChrAsmSlot::WeaponLeft2
+            | ChrAsmSlot::WeaponRight2
+            | ChrAsmSlot::WeaponLeft3
+            | ChrAsmSlot::WeaponRight3
+            | ChrAsmSlot::Arrow1
+            | ChrAsmSlot::Bolt1
+            | ChrAsmSlot::Arrow2
+            | ChrAsmSlot::Bolt2
+            | ChrAsmSlot::Arrow3
+            | ChrAsmSlot::Bolt3 => category == ItemCategory::Weapon,
+
+            ChrAsmSlot::ProtectorHead
+            | ChrAsmSlot::ProtectorChest
+            | ChrAsmSlot::ProtectorHands
+            | ChrAsmSlot::ProtectorLegs => category == ItemCategory::Protector,
+
+            ChrAsmSlot::Accessory1
+            | ChrAsmSlot::Accessory2
+            | ChrAsmSlot::Accessory3
+            | ChrAsmSlot::Accessory4
+            | ChrAsmSlot::AccessoryCovenant => category == ItemCategory::Accessory,
+
+            ChrAsmSlot::Unused16 => false,
+        }
+    }
+
     pub fn from_index(index: u32) -> Result<Self, ChrAsmSlotError> {
         match index {
             0 => Ok(ChrAsmSlot::WeaponLeft1),
@@ -1637,5 +1947,41 @@ mod tests {
             ((mapping.mapping.0 >> 12) & 0xFFF) as i16 - 1
         );
         assert_eq!(mapping.item_slot(), (mapping.mapping.0 & 0xFFF) as i16);
+    }
+
+    /// The last entry on the free list stores `0` in its chain field ("no
+    /// next"), which has to pop as a valid entry that leaves the head at
+    /// `-1` — not fail the pop. Failing it makes `update_item_id_mapping`
+    /// bail, so the item keeps its inventory entry but never enters the
+    /// lookup map, and `find_item_idx`/`GetItemInventoryIdx` can't see it.
+    #[test]
+    fn last_free_entry_pops_and_empties_the_list() {
+        // Two entries: 0 -> 1 -> end. Chain field is 1-based, 0 = no next.
+        let mut entries = [
+            ItemIdMapping {
+                item_id: OptionalItemId::NONE,
+                mapping: ItemIdMappingBits(0),
+            },
+            ItemIdMapping {
+                item_id: OptionalItemId::NONE,
+                mapping: ItemIdMappingBits(0),
+            },
+        ];
+        entries[0].set_next_chain_idx(Some(1));
+        entries[1].set_next_chain_idx(None);
+
+        assert_eq!(entries[0].next_chain_idx(), Some(1));
+        assert_eq!(entries[1].next_chain_idx(), None);
+
+        // Popping entry 0 leaves head at 1; popping entry 1 — the last one —
+        // must still succeed and leave the head at -1.
+        let head_after_first = entries[0].next_chain_idx().unwrap_or(-1);
+        assert_eq!(head_after_first, 1);
+
+        let head_after_last = entries[1].next_chain_idx().unwrap_or(-1);
+        assert_eq!(
+            head_after_last, -1,
+            "last free entry must empty the list, not abort the pop"
+        );
     }
 }

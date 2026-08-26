@@ -10,6 +10,7 @@
 /// These are populated from `mapper-profile.toml` in the root of this package
 /// using `tools/binary-generator`.
 pub struct RvaBundle {
+    pub broadcast_equipment_change: u32,
     pub character_type_properties: u32,
     pub chr_cam_vmt: u32,
     pub chr_ins_apply_speffect: u32,
