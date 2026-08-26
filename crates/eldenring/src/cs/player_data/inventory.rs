@@ -1,11 +1,15 @@
 use thiserror::Error;
 
+use fromsoftware_shared::program::Program;
+use pelite::pe::Pe;
+
 use crate::cs::{
-    CSGaitemImp, ChrAsmArmStyle, ChrAsmSlot, EquipDataItem, EquipGameData, EquipInventoryData,
-    EquipInventoryDataListEntry, EquipParamGem, EquipParamWeapon, GaitemCategory, GaitemHandle,
-    GameDataMan, ItemCategory, ItemId, ItemIdError, OptionalItemId, ReinforceParamWeapon,
-    SoloParamRepository,
+    CSGaitemImp, CSMenuManImp, ChrAsmArmStyle, ChrAsmSlot, EquipDataItem, EquipGameData,
+    EquipInventoryData, EquipInventoryDataListEntry, EquipParamGem, EquipParamWeapon,
+    GaitemCategory, GaitemHandle, GameDataMan, ItemCategory, ItemId, ItemIdError, OptionalItemId,
+    ReinforceParamWeapon, SoloParamRepository,
 };
+use crate::rva;
 use shared::FromStatic;
 
 /// An error giving an item can fail with.
@@ -463,6 +467,106 @@ impl EquipGameData {
                 index: -1,
             };
         }
+
+        // Clearing a quick slot can strand the selection on it, and dropping
+        // an equipped item changes the loadout other players see.
+        self.revalidate_selected_quick_slot();
+        self.broadcast_equipment_change();
+    }
+
+    /// Tells other players in the session that this character's equipment
+    /// changed, so they render the new loadout.
+    ///
+    /// Calls `BroadcastPacket12CharacterData` (`0x140ca11c0`), which fills a
+    /// packet from the main player's equipment and hands it to
+    /// `CSSessionManagerImp::P2PBroadcast`. The real equip, unequip and
+    /// item-removal paths all reach this; without it remote players keep
+    /// seeing whatever was equipped when they last got an update.
+    ///
+    /// Takes no arguments and guards itself: it returns early when there's no
+    /// main player game data or the character has no event id, so calling it
+    /// outside a session is harmless.
+    ///
+    /// Only meaningful for the main player, so this is a no-op otherwise.
+    pub fn broadcast_equipment_change(&self) {
+        if !self.is_main_player {
+            return;
+        }
+
+        let Ok(va) = Program::current().rva_to_va(rva::get().broadcast_equipment_change) else {
+            return;
+        };
+
+        // SAFETY: the RVA resolves to `BroadcastPacket12CharacterData`, which
+        // takes no parameters and reads its state from globals.
+        unsafe {
+            let broadcast: extern "C" fn() = std::mem::transmute(va);
+            broadcast();
+        }
+    }
+
+    /// Re-points the selected quick slot when the item behind it moved.
+    ///
+    /// Mirrors `CS::EquipGameData::RevalidateSelectedQuickSlot`
+    /// (`0x140249a90`): if the selected inventory index no longer maps to a
+    /// quick slot, fall back to whatever occupies the slot it used to be in,
+    /// and failing that advance to the next occupied slot. The real equip,
+    /// unequip and auto-equip paths all call this.
+    pub fn revalidate_selected_quick_slot(&mut self) {
+        let selected = self.equip_item_data.selected_quick_slot;
+
+        // The slot the selected item currently sits in, if any.
+        let slot_of_selected = self
+            .equip_item_data
+            .quick_slots
+            .iter()
+            .position(|entry| entry.index == selected);
+
+        if selected != -1 {
+            if slot_of_selected.is_some() {
+                return;
+            }
+            // The item moved: keep the same slot position if something else
+            // now occupies it.
+            if let Some(entry) = self
+                .equip_item_data
+                .quick_slots
+                .iter()
+                .find(|entry| entry.index != -1)
+            {
+                self.equip_item_data.selected_quick_slot = entry.index;
+                return;
+            }
+        }
+
+        self.select_next_occupied_quick_slot();
+    }
+
+    /// Moves the selection to the next quick slot holding something, or
+    /// clears it when every slot is empty.
+    ///
+    /// Mirrors `EquipItemData::SelectNextOccupiedQuickSlot` (`0x14024f7e0`).
+    fn select_next_occupied_quick_slot(&mut self) {
+        let next = self
+            .equip_item_data
+            .quick_slots
+            .iter()
+            .map(|entry| entry.index)
+            .find(|index| *index != -1);
+
+        self.equip_item_data.selected_quick_slot = next.unwrap_or(-1);
+    }
+
+    /// Records the inventory index the player last equipped, which the
+    /// equipment menu uses to restore its cursor.
+    ///
+    /// The real equip path writes `CSMenuMan::lastEquippedItemIndex` at every
+    /// exit.
+    fn set_last_equipped_item_index(inventory_slot: u32) {
+        let Ok(menu_man) = (unsafe { CSMenuManImp::instance_mut() }) else {
+            return;
+        };
+        menu_man.last_equipped_item_index = inventory_slot as i32;
     }
 
     /// Finds the [`ChrAsmSlot`] currently equipped to the given global
@@ -530,6 +634,27 @@ impl EquipGameData {
             return false;
         }
 
+        // The real path checks whether this entry is already equipped
+        // somewhere before writing: re-equipping into the slot it already
+        // occupies toggles it off, and equipping it into a *different* slot
+        // vacates the old one first. Skipping this leaves one inventory entry
+        // referenced by two `ChrAsm` slots.
+        //
+        // The "nothing equipped" placeholders are exempt. One such entry is
+        // shared by every empty slot of its kind, so displacing it would
+        // empty an unrelated slot — and since `unequip_slot` equips a
+        // placeholder by calling back into this method, it would also
+        // recurse.
+        let is_placeholder = Self::default_item_for_empty_slot(slot) == Some(item_id);
+        if !is_placeholder
+            && let Some(current) = self.find_equipped_slot(inventory_slot)
+        {
+            unsafe { self.unequip_slot(gaitem, current) };
+            if current == slot {
+                return true;
+            }
+        }
+
         let Some(entry_handle) = self
             .equip_inventory_data
             .items_data
@@ -557,6 +682,13 @@ impl EquipGameData {
             }
             self.chr_asm.bolt_loaded_states[slot as usize] = false;
         }
+
+        // The tail of the real equip path, which runs after the arrays are
+        // written: menu cursor, quick-slot selection, then the network
+        // broadcast.
+        Self::set_last_equipped_item_index(inventory_slot);
+        self.revalidate_selected_quick_slot();
+        self.broadcast_equipment_change();
 
         true
     }
@@ -608,6 +740,11 @@ impl EquipGameData {
         self.chr_asm.equipment_param_ids[slot as usize] = -1;
         self.equipment_entries[slot] = OptionalItemId::NONE;
         self.equipment_item_idx_list[slot as usize] = u32::MAX;
+
+        // Only this branch needs them: the default-item path above returns
+        // through `equip_slot`, which fires the same side effects itself.
+        self.revalidate_selected_quick_slot();
+        self.broadcast_equipment_change();
     }
 
     fn default_item_for_empty_slot(slot: ChrAsmSlot) -> Option<ItemId> {

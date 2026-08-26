@@ -58,7 +58,13 @@ pub struct CSMenuManImp {
     /// disables all save menu callbacks
     /// additionally, can disable auto save
     pub disable_save_menu: u32,
-    unk140: [u8; 0x520],
+    unk140: [u8; 0x78],
+    /// Inventory index of the item the player last equipped, which the
+    /// equipment menu uses to restore its cursor position.
+    ///
+    /// Written by the real equip path at every exit.
+    pub last_equipped_item_index: i32,
+    unk1bc: [u8; 0x4a4],
     pub player_menu_ctrl: CSPlayerMenuCtrl,
     null_player_menu_ctrl: usize,
     unk6b0: [u8; 0x60],
