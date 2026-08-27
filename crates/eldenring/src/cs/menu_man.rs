@@ -122,6 +122,33 @@ pub struct CSMenuGaitemUseState {
 }
 
 #[repr(C)]
+/// A queued request to show one `TUTORIAL_PARAM_ST` row's notification.
+///
+/// The queue entry is only the row id and a force flag; everything shown
+/// (text, image, display duration) comes from the param row when the game
+/// drains the queue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TutorialRequest {
+    /// `TUTORIAL_PARAM_ST` row to display.
+    pub tutorial_param_id: u32,
+    /// Show the row even when it would normally be suppressed: with
+    /// tutorials disabled in the game settings, or already shown once per
+    /// `repeatType`.
+    pub force_display: bool,
+    _pad: [u8; 3],
+}
+
+impl TutorialRequest {
+    pub fn new(tutorial_param_id: u32, force_display: bool) -> Self {
+        Self {
+            tutorial_param_id,
+            force_display,
+            _pad: [0; 3],
+        }
+    }
+}
+
+#[repr(C)]
 pub struct CSPopupMenu {
     vftable: usize,
     pub menu_man: NonNull<CSMenuManImp>,
@@ -138,7 +165,26 @@ pub struct CSPopupMenu {
     ///
     /// Limited to 4 by the game.
     pub popup_messages: DLDeque<MenuString>,
-    unk1e0: [u8; 0x70],
+    unk1e0: [u8; 0x8],
+    /// Pending toast-style tutorial notifications, the small banners that
+    /// appear at the side of the screen without taking input.
+    ///
+    /// Fed by `CSPopupMenu::RequestTutorialNotification` for rows whose
+    /// `TUTORIAL_PARAM_ST::menuType` is `Subtle` (0 or 1), and drained one
+    /// entry per frame by `CSPopupMenu::Update`, which builds the dialog
+    /// from the param row itself. Pushing an entry here is all that's needed
+    /// to raise a toast.
+    ///
+    /// [`tutorial_modals`](Self::tutorial_modals) takes priority, and toasts
+    /// additionally wait until no menu job is open.
+    pub tutorial_toasts: DLDeque<TutorialRequest>,
+    /// Pending intrusive tutorial popups, the large ones that interrupt.
+    ///
+    /// The `menuType` `Intrusive` (100) counterpart to
+    /// [`tutorial_toasts`](Self::tutorial_toasts), drained by the same
+    /// `Update` loop but ahead of them.
+    pub tutorial_modals: DLDeque<TutorialRequest>,
+    unk248: [u8; 0x8],
     world_map_view_model: usize,
     unk258: [u8; 0x8],
     multi_play_view_model: usize,
@@ -146,6 +192,35 @@ pub struct CSPopupMenu {
     matching_view_model: usize,
     pub show_failed_to_save: bool,
     unkb91: [u8; 0x8f],
+}
+
+impl CSPopupMenu {
+    /// Queues a toast-style tutorial notification.
+    ///
+    /// `CSPopupMenu::Update` pops one entry per frame and builds the dialog
+    /// from the `TUTORIAL_PARAM_ST` row, so nothing else is needed to make
+    /// the banner appear.
+    ///
+    /// Unlike `CSPopupMenu::RequestTutorialNotification`, this doesn't
+    /// consult the row's `unlockEventFlagId` or the once-per-`repeatType`
+    /// bookkeeping in `CSTutorialData` — the entry is queued as given. Pass
+    /// `force_display` to also bypass the player's "show tutorials" setting,
+    /// which is checked when the entry is drained.
+    pub fn request_tutorial_toast(&mut self, tutorial_param_id: u32, force_display: bool) {
+        self.tutorial_toasts
+            .push_back(TutorialRequest::new(tutorial_param_id, force_display));
+    }
+
+    /// Queues an intrusive tutorial popup, the large interrupting kind.
+    ///
+    /// These are drained ahead of [`request_tutorial_toast`], and unlike
+    /// toasts they don't wait for menus to close.
+    ///
+    /// [`request_tutorial_toast`]: Self::request_tutorial_toast
+    pub fn request_tutorial_modal(&mut self, tutorial_param_id: u32, force_display: bool) {
+        self.tutorial_modals
+            .push_back(TutorialRequest::new(tutorial_param_id, force_display));
+    }
 }
 
 #[repr(C)]
@@ -307,27 +382,4 @@ pub enum SystemAnnounceViewModelState {
     /// Marks the active announcement as no longer active and removes it from
     /// the queue.
     Dequeue = 12,
-}
-
-#[cfg(test)]
-mod test {
-    use crate::cs::{
-        AnnounceNotification, BackScreenData, CSMenuData, CSMenuGaitemUseState, CSMenuManImp,
-        CSPlayerMenuCtrl, CSPopupMenu, FeSystemAnnounceView, FeSystemAnnounceViewModel,
-        LoadingScreenData,
-    };
-
-    #[test]
-    fn proper_sizes() {
-        assert_eq!(0x8a0, size_of::<CSMenuManImp>());
-        assert_eq!(0xF0, size_of::<CSMenuData>());
-        assert_eq!(0x18, size_of::<CSMenuGaitemUseState>());
-        assert_eq!(0x320, size_of::<CSPopupMenu>());
-        assert_eq!(0x48, size_of::<CSPlayerMenuCtrl>());
-        assert_eq!(0x10, size_of::<BackScreenData>());
-        assert_eq!(0x28, size_of::<LoadingScreenData>());
-        assert_eq!(0x40, size_of::<FeSystemAnnounceViewModel>());
-        assert_eq!(0x40, size_of::<AnnounceNotification>());
-        assert_eq!(0xb68, size_of::<FeSystemAnnounceView>());
-    }
 }

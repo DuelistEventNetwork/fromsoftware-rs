@@ -508,53 +508,78 @@ impl EquipGameData {
     /// Re-points the selected quick slot when the item behind it moved.
     ///
     /// Mirrors `CS::EquipGameData::RevalidateSelectedQuickSlot`
-    /// (`0x140249a90`): if the selected inventory index no longer maps to a
-    /// quick slot, fall back to whatever occupies the slot it used to be in,
-    /// and failing that advance to the next occupied slot. The real equip,
-    /// unequip and auto-equip paths all call this.
+    /// (`0x140249a90`). `selected_quick_slot` holds a slot position, not an
+    /// inventory index, so the item is resolved through the slot first: if it
+    /// still occupies a slot nothing changes, otherwise the same position is
+    /// reused when something else moved into it, and failing that the search
+    /// advances from that position.
     pub fn revalidate_selected_quick_slot(&mut self) {
-        let selected = self.equip_item_data.selected_quick_slot;
+        let position = self.selected_quick_slot_position();
+        let item_index = self.selected_quick_slot_item_index();
 
-        // The slot the selected item currently sits in, if any.
-        let slot_of_selected = self
-            .equip_item_data
-            .quick_slots
-            .iter()
-            .position(|entry| entry.index == selected);
-
-        if selected != -1 {
-            if slot_of_selected.is_some() {
+        if item_index != -1 {
+            if self.quick_slot_position_of(item_index).is_some() {
                 return;
             }
-            // The item moved: keep the same slot position if something else
-            // now occupies it.
-            if let Some(entry) = self
-                .equip_item_data
-                .quick_slots
-                .iter()
-                .find(|entry| entry.index != -1)
+            if let Some(position) = position
+                && self.equip_item_data.quick_slots[position].index != -1
             {
-                self.equip_item_data.selected_quick_slot = entry.index;
+                self.equip_item_data.selected_quick_slot = position as i32;
                 return;
             }
         }
 
-        self.select_next_occupied_quick_slot();
+        self.select_next_occupied_quick_slot(position);
     }
 
-    /// Moves the selection to the next quick slot holding something, or
-    /// clears it when every slot is empty.
+    /// The selected slot's position, or `None` when nothing is selected.
+    fn selected_quick_slot_position(&self) -> Option<usize> {
+        let selected = self.equip_item_data.selected_quick_slot;
+        (selected >= 0 && (selected as usize) < self.equip_item_data.quick_slots.len())
+            .then_some(selected as usize)
+    }
+
+    /// The inventory index the selected slot points at.
     ///
-    /// Mirrors `EquipItemData::SelectNextOccupiedQuickSlot` (`0x14024f7e0`).
-    fn select_next_occupied_quick_slot(&mut self) {
-        let next = self
-            .equip_item_data
+    /// Mirrors `EquipItemData::GetSelectedQuickslotItemIndex` (`0x14024f410`).
+    fn selected_quick_slot_item_index(&self) -> i32 {
+        match self.selected_quick_slot_position() {
+            Some(position) => self.equip_item_data.quick_slots[position].index,
+            None => -1,
+        }
+    }
+
+    /// The position of the slot holding `item_index`.
+    ///
+    /// Mirrors `EquipItemData::GetQuickSlotIndexByInventoryIndex`
+    /// (`0x14024f2c0`).
+    fn quick_slot_position_of(&self, item_index: i32) -> Option<usize> {
+        if item_index == -1 {
+            return None;
+        }
+        self.equip_item_data
             .quick_slots
             .iter()
-            .map(|entry| entry.index)
-            .find(|index| *index != -1);
+            .position(|entry| entry.index == item_index)
+    }
 
-        self.equip_item_data.selected_quick_slot = next.unwrap_or(-1);
+    /// Moves the selection to the next occupied slot after `from`, wrapping,
+    /// or clears it when every slot is empty.
+    ///
+    /// Mirrors `EquipItemData::SelectNextOccupiedQuickSlot` (`0x14024f7e0`)
+    /// and `FindNextOccupiedQuickSlot` (`0x1402501a0`): the search starts at
+    /// `from + 1` and wraps, and an unset selection starts from the last slot
+    /// so the scan begins at position 0.
+    fn select_next_occupied_quick_slot(&mut self, from: Option<usize>) {
+        let slots = &self.equip_item_data.quick_slots;
+        let count = slots.len();
+        let start = from.unwrap_or(count - 1);
+
+        let next = (1..=count)
+            .map(|offset| (start + offset) % count)
+            .find(|position| slots[*position].index != -1);
+
+        self.equip_item_data.selected_quick_slot = next.map_or(-1, |position| position as i32);
     }
 
     /// Records the inventory index the player last equipped, which the
@@ -646,9 +671,7 @@ impl EquipGameData {
         // placeholder by calling back into this method, it would also
         // recurse.
         let is_placeholder = Self::default_item_for_empty_slot(slot) == Some(item_id);
-        if !is_placeholder
-            && let Some(current) = self.find_equipped_slot(inventory_slot)
-        {
+        if !is_placeholder && let Some(current) = self.find_equipped_slot(inventory_slot) {
             unsafe { self.unequip_slot(gaitem, current) };
             if current == slot {
                 return true;

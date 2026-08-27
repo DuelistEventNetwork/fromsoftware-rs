@@ -18,6 +18,7 @@ pub(crate) mod lua_event_man;
 pub(crate) mod menu_man;
 pub(crate) mod modules;
 pub(crate) mod mouse_manager;
+pub(crate) mod msg_tag;
 pub(crate) mod net_man;
 pub(crate) mod pad_manager;
 pub(crate) mod param;

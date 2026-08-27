@@ -486,8 +486,7 @@ impl DebugDisplay for EquipGameData {
 
                             let mut problems = Vec::new();
                             if entry != resolved {
-                                problems
-                                    .push(format!("entries={entry:?} idx_list->{resolved:?}"));
+                                problems.push(format!("entries={entry:?} idx_list->{resolved:?}"));
                             }
                             if let Some(entry_handle) = entry_handle
                                 && entry_handle != equipped_handle
