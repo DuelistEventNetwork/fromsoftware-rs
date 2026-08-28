@@ -123,7 +123,7 @@ pub const RVAS: RvaBundle = RvaBundle {
     msb_repository_vmt: 0x2baa340,
     multiplay_properties: 0x3b15230,
     near_enemy_finder_vmt: 0x2a282d0,
-    network_heap_allocator: 0x0,
+    network_heap_allocator: 0x3d8b3a8,
     obtain_dl_user_input_manager: 0x1328d0,
     open_field_chr_set_vmt: 0x2a4b620,
     pad_device_vmt: 0x30cd048,

@@ -441,7 +441,7 @@ pattern = "4c 8d 0d $ { \"M\" 00 \"E\" 00 \"N\" 00 \"U\" 00 } 4d 8b c7 48 8d 15 
 
 [[patterns]]
 captures = ["", "network_heap_allocator"]
-pattern = "48 8b d0 48 8d 3d f3 dd f6 02 48 8b cf e8 [4] 48 89 3d ${ ' }"
+pattern = "48 8b d0 48 8d 3d [4] 48 8b cf e8 [4] 48 89 3d ${ ' }"
 
 [[patterns]]
 captures = ["", "debug_heap_allocator"]
