@@ -338,15 +338,15 @@ impl EquipGameData {
         let Some(weapon) = repo.get::<EquipParamWeapon>(item_id.base_weapon_param_id()) else {
             return;
         };
-        let Some(reinforce) = repo.get::<ReinforceParamWeapon>(weapon.reinforce_type_id() as u32)
-        else {
+        let reinforce_row = weapon.reinforce_type_id() as u32 + item_id.weapon_upgrade_level();
+        let Some(reinforce) = repo.get::<ReinforceParamWeapon>(reinforce_row) else {
             return;
         };
-        let max_reinforce_level = reinforce.max_reinforce_level();
+        let level = reinforce.max_reinforce_level();
 
         let player_game_data = unsafe { self.player_game_data.as_mut() };
-        if max_reinforce_level > player_game_data.matching_weapon_level {
-            player_game_data.matching_weapon_level = max_reinforce_level;
+        if level > player_game_data.matching_weapon_level {
+            player_game_data.matching_weapon_level = level;
         }
     }
 
