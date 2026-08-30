@@ -1,11 +1,12 @@
 use std::ptr::NonNull;
 
-use shared::{F32Vector3, FromStatic, OwnedPtr};
+use shared::{F32Vector3, FromStatic, OwnedPtr, StepperStates};
 
 use crate::{
     DLList,
     cs::{BlockId, MultiplayType, SummonParamType, WorldAreaTime},
     dlkr::{InGameHeapAllocator, MainHeapAllocator},
+    fd4::{FD4StepBase, FD4StepBaseInterface},
 };
 
 use super::SosSignMan;
@@ -84,12 +85,27 @@ pub struct CSEventSosSignCtrl {
     unk54: i32,
 }
 
+/// State machine for [`CSEventWorldAreaTimeCtrl`].
+#[repr(i32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, StepperStates)]
+pub enum CSEventWorldAreaTimeCtrlState {
+    NotExecuting = -1,
+    StandBy = 0,
+    FadeOut = 1,
+    WaitFadeOut = 2,
+    ApplyTime = 3,
+    WaitLuaEventRespawn = 4,
+    WaitApplyTime = 5,
+    FadeIn = 6,
+    WaitFadeIn = 7,
+}
+
 #[repr(C)]
 pub struct CSEventWorldAreaTimeCtrl {
-    /// Base step machine interface (vftable + state management)
-    base: [u8; 0x40],
-    unk40: [u8; 0x68],
-    unka8: bool,
+    pub stepper: FD4StepBase<Self, FD4StepBaseInterface, CSEventWorldAreaTimeCtrlState>,
+    /// Guards the refcount on [`WorldAreaTime`]
+    /// Set in [`CSEventWorldAreaTimeCtrlState::StandBy`], cleared in [`CSEventWorldAreaTimeCtrlState::WaitFadeIn`]
+    pub world_area_time_ref_held: bool,
     /// Hours component of target time (0-23)
     /// Represents absolute hour to set
     pub target_hours: u32,
@@ -138,12 +154,14 @@ pub struct CSEventWorldAreaTimeCtrl {
     /// Compared against `black_screen_time` to ensure minimum duration
     pub black_screen_elapsed_time: f32,
     /// Flag indicating Lua event respawn is pending
-    /// Cleared when respawn processing completes or times out
+    /// Cleared by `CSLuaEventConditionBonfire` once the bonfire's own reset timer
+    /// completes, or by [`CSEventWorldAreaTimeCtrlState::WaitLuaEventRespawn`] once [`Self::black_screen_timeout`] is exceeded
     pub respawn_wait_flag: bool,
-    unked: bool,
-    unkee: bool,
-    unkef: bool,
-    unkf0: bool,
+    pub fade_sequence_active: bool,
+    /// "Was a remo/cutscene active" cache used by the fade plate helper.
+    pub remo_was_active: bool,
+    pub fade_plate_dirty: bool,
+    pub black_screen_active: bool,
     /// Total elapsed time since transition started (seconds)
     /// Accumulates through all phases of the time change
     pub total_elapsed_time: f32,
@@ -193,6 +211,18 @@ impl CSEventWorldAreaTimeCtrl {
         self.fade_out_time = params.fade_out_time;
         self.fade_in_time = params.fade_in_time;
     }
+
+    /// Cut a transition that is holding the black screen short, by sending the stepper straight to
+    /// [`CSEventWorldAreaTimeCtrlState::FadeIn`].
+    pub fn end_black_screen_early(&mut self) {
+        self.black_screen_time = 0.0;
+        self.black_screen_elapsed_time = 0.0;
+        self.update_elapsed_time = 0.0;
+        self.respawn_wait_flag = false;
+
+        self.stepper.current_state = CSEventWorldAreaTimeCtrlState::FadeIn;
+        self.stepper.requested_state = CSEventWorldAreaTimeCtrlState::FadeIn;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -235,8 +265,12 @@ impl Default for TimeTransitionParams {
 }
 
 impl TimeTransitionParams {
+    /// Matches the `FadeOutAndPassTime` call the vanilla bonfire rest talk script makes, so a
+    /// transition requested with these looks like an ordinary grace sit.
     pub fn bonfire_rest() -> Self {
         Self {
+            black_screen_time: 0.0,
+            clock_move_time_s: 1.5,
             reset_world: true,
             reset_main_character: true,
             reset_magic_charges: true,

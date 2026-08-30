@@ -10,8 +10,14 @@ use hudhook::{ImguiRenderLoop, eject, hooks::dx12::ImguiDx12Hooks};
 
 use debug::*;
 use eldenring::cs::*;
-use eldenring::{fd4::FD4ParamRepository, util::system::wait_for_system_init};
+use eldenring::{
+    fd4::FD4ParamRepository,
+    util::{input, system::wait_for_system_init},
+};
 use fromsoftware_shared::{FromStatic, program::Program};
+
+/// VK_INSERT
+const VK_INSERT: i32 = 0x2D;
 
 mod display;
 use display::StaticDebugger;
@@ -139,6 +145,12 @@ unsafe fn render_live_reload(gui: &mut EldenRingDebugGui, ui: &mut Ui) {
     let io = ui.io();
     let blocker = InputBlocker::get_instance();
     blocker.block_from_io(io);
+
+    if input::is_key_pressed(VK_INSERT)
+        && let Ok(menu_man) = unsafe { CSMenuManImp::instance_mut() }
+    {
+        menu_man.disable_mouse_cursor = !menu_man.disable_mouse_cursor;
+    }
 
     ui.window("Elden Ring Rust Bindings Debug")
         .position([0., 0.], Condition::FirstUseEver)

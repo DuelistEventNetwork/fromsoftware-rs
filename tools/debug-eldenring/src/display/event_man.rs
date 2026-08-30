@@ -61,6 +61,9 @@ impl DebugDisplay for CSEventScriptEventInfo {
 
 impl DebugDisplay for CSEventWorldAreaTimeCtrl {
     fn render_debug(&self, ui: &Ui) {
+        ui.debug("Current State", self.stepper.current_state);
+        ui.debug("Requested State", self.stepper.requested_state);
+        ui.display("World Area Time Ref Held", self.world_area_time_ref_held);
         ui.display("Target Hours", self.target_hours);
         ui.display("Target Minutes", self.target_minutes);
         ui.display("Target Seconds", self.target_seconds);
@@ -81,6 +84,10 @@ impl DebugDisplay for CSEventWorldAreaTimeCtrl {
         ui.display("Update Elapsed Time", self.update_elapsed_time);
         ui.display("Black Screen Elapsed Time", self.black_screen_elapsed_time);
         ui.display("Respawn Wait Flag", self.respawn_wait_flag);
+        ui.display("Fade Sequence Active", self.fade_sequence_active);
+        ui.display("Remo Was Active", self.remo_was_active);
+        ui.display("Fade Plate Dirty", self.fade_plate_dirty);
+        ui.display("Black Screen Active", self.black_screen_active);
         ui.display("Total Elapsed Time", self.total_elapsed_time);
         ui.display("Black Screen Timeout", self.black_screen_timeout);
     }

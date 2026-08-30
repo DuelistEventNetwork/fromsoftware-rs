@@ -13,6 +13,10 @@ pub struct WorldAreaTime {
     unk34: f32,
     pub time_passage_multiplier: f32,
     unk3c: f32,
+    /// Count of in-flight [`CSEventWorldAreaTimeCtrl`] transitions holding a reference.
+    ///
+    /// [`CSEventWorldAreaTimeCtrl`]: crate::cs::CSEventWorldAreaTimeCtrl
+    pub ref_count: i32,
     // TODO: rest
 }
 
