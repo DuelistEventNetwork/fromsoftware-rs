@@ -131,7 +131,7 @@ pub struct ChrIns {
     pub field_ins_handle: FieldInsHandle,
     pub chr_set_entry: NonNull<ChrSetEntry<Self>>,
     unk18: usize,
-    pub backread_state: u32,
+    pub backread_state: ChrBackreadState,
     unk24: u32,
     chr_res: usize,
     pub block_id: BlockId,
@@ -238,7 +238,10 @@ pub struct ChrIns {
     unk1e0: u32,
     pub network_authority: u32,
     pub event_entity_id: u32,
-    unk1ec: f32,
+    /// Countdown to the next parts-damage HP buff tick, in seconds. Reset to 1.0 on each
+    /// tick. Only counts down while
+    /// [ChrInsFlags1c8::parts_hp_buff_tick_enabled] is set.
+    pub parts_hp_buff_timer: f32,
     unk1f0: OwnedPtr<(), MainHeapAllocator>,
     pub npc_sp_effect_equip_ctrl: OwnedPtr<NpcSpEffectEquipCtrl, MainHeapAllocator>,
     unk200: usize,
@@ -483,12 +486,23 @@ bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ChrInsFlags1c8(u8);
     impl Debug;
+    /// Enables the periodic parts-damage HP buff tick driven off
+    /// [ChrIns::parts_hp_buff_timer].
+    pub parts_hp_buff_tick_enabled, set_parts_hp_buff_tick_enabled: 1;
     /// Request the fall death camera to be enabled.
-    pub request_falldeath_camera, set_request_falldeath_camera: 2;
-    /// True when update tasks for this character have been registered.
-    pub update_tasks_registered, set_update_tasks_registered:   3;
-    /// This flag controls whether the character considered active or not
-    pub is_active, set_is_active:                               4;
+    pub request_falldeath_camera, set_request_falldeath_camera:   2;
+    /// Requests a rendering refresh for this character.
+    ///
+    /// `CS::WorldChrManImp::UpdateChrRendering` only descends into a character when this
+    /// and [Self::is_active] are both set; the per-character update then clears it, so it
+    /// is a one-shot request rather than persistent state. Set by `CS::ChrIns::Respawn`.
+    pub request_rendering_update, set_request_rendering_update:   3;
+    /// Whether the character is live. Mirrored by `CS::ChrIns::IsActiveCharacter`.
+    ///
+    /// Cleared only by `CS::ChrIns::Unload`, which additionally frees the character's six
+    /// update tasks and releases its model, so clearing this by hand does not stop a
+    /// character and setting it by hand does not restart an unloaded one.
+    pub is_active, set_is_active:                                 4;
 }
 
 bitfield! {
@@ -514,13 +528,29 @@ bitfield! {
 
 bitfield! {
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    /// Backread (streaming) state for a character.
+    pub struct ChrBackreadState(u32);
+    impl Debug;
+    pub suppressed, set_suppressed: 8;
+}
+
+bitfield! {
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ChrInsActivationFlags(u32);
+    impl Debug;
     /// Set when the character is determined to be "left behind" (too far from other players).
-    pub is_left_behind, set_is_left_behind:         0;
+    ///
+    /// Only written outside of networked sessions, in multiplayer the distance test runs
+    /// over every session player instead, so this retains whatever it last held.
+    pub is_left_behind, set_is_left_behind:                             0;
+    pub npc_param_activation_enabled, set_npc_param_activation_enabled: 1;
     /// Controlled by npc param NPC_PARAM_ST::disableActivateOpen or NPC_PARAM_ST::disableActivateLegacy depending on
     /// block id in ChrDataModule
-    pub activation_enabled, set_activation_enabled: 3;
-    impl Debug;
+    ///
+    /// Gates the backread budget: when cleared, the character is pinned to
+    /// [ChrUpdateType::Local] and can never be queued for unload regardless of distance
+    /// or how far down the distance-sorted list it ranks.
+    pub activation_enabled, set_activation_enabled:                     3;
 }
 
 bitfield! {

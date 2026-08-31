@@ -983,6 +983,11 @@ fn chr_ins_common_debug(chr_ins: &mut ChrIns, ui: &Ui, state: &mut ChrInsState) 
     ui.nested("Initial Position", chr_ins.initial_position);
     ui.nested("Initial Orientation", chr_ins.initial_orientation_euler);
 
+    ui.debug("Backread State", chr_ins.backread_state);
+    ui.debug("Activation Flags", chr_ins.chr_activation_flags);
+    ui.debug("Flags 1c8", chr_ins.chr_flags1c8);
+    ui.debug("Debug Flags", chr_ins.debug_flags);
+
     ui.display("Last hit by", chr_ins.last_hit_by);
     ui.debug("TAE use item", chr_ins.tae_queued_use_item);
 

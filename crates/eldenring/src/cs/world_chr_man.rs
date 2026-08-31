@@ -431,10 +431,17 @@ pub enum ChrLoadStatus {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChrUpdateType {
+    /// Simulated locally. Also what characters with
+    /// [ChrInsActivationFlags::activation_enabled] cleared are pinned to, which keeps them
+    /// out of the backread budget's unload path entirely.
     Local = 0,
     Unknown1 = 1,
-    Unknown2 = 2,
+    /// Deactivated by the backread budget in
+    /// [CS::WorldChrManImp::WorldChrMan_Update_BackreadRequestPost]: the character ranked
+    /// past the distance-sorted cutoff and is queued for unload.
+    Deactivated = 2,
     Unknown3 = 3,
+    /// Driven by NetChrSync placement packets rather than local simulation.
     Remote = 4,
 }
 
