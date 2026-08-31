@@ -5,29 +5,40 @@ mod generated;
 pub use generated::*;
 
 impl EQUIP_PARAM_WEAPON_ST {
-    /// Whether `gem` (an [`EQUIP_PARAM_GEM_ST`] row) can be mounted on this
-    /// weapon — mirrors the real `CanMountGemWithAffinityOnWeapon`
-    /// (`0x140d549d0`), reached from
-    /// `CS::EquipGameData::RemoveInvalidAshesOfWarFromEquippedWeapons`
-    /// (`0x14025e200`, named for the popup it shows on failure: "Invalid
-    /// Ashes of War have been removed from equipped weapons", `GR_Dialogues`
-    /// id `550300`). That real path only ever *removes* an already-mounted
-    /// invalid ash; nothing in the game keeps a give from mounting one in
-    /// the first place, so callers giving a weapon should use this to gate
-    /// the mount itself instead of giving a combination the game would
-    /// immediately have to correct on its own.
+    /// The affinity id the gem check runs against, for a weapon given by its
+    /// **full** param id (`base + affinity * 100 + reinforce_level`) — mirrors
+    /// `GetLockedAffinityIdForGemCheck`, which reads `(paramId % 10000) / 100`
+    /// and returns `0` instead whenever the weapon's affinity is locked
+    /// (`disable_gem_attr`).
     ///
-    /// `affinity_id` is this weapon id's own affinity digit (`(param_id %
-    /// 10000) / 100`) and `max_gem_rank` is
-    /// `ReinforceParamWeapon::enable_gem_rank` for this weapon's
-    /// `reinforce_type_id` row — both keyed differently than this struct
-    /// itself, so resolving them is left to the caller (e.g.
+    /// Takes the full id rather than the `+0` base: `% 10000` is what isolates
+    /// the affinity and reinforcement digits, so rounding the level off first
+    /// is a different operation that only coincidentally agrees.
+    pub fn gem_check_affinity_id(&self, weapon_param_id: u32) -> u32 {
+        if self.disable_gem_attr() {
+            return 0;
+        }
+        (weapon_param_id % 10000) / 100
+    }
+
+    /// Whether `gem` (an [`EQUIP_PARAM_GEM_ST`] row) can be mounted on this
+    /// weapon — mirrors `CanMountGemWithAffinityOnWeapon`, reached from
+    /// `CS::EquipGameData::RemoveInvalidAshesOfWarFromEquippedWeapons`. That
+    /// path only ever *removes* an already-mounted invalid ash; nothing in the
+    /// game keeps a give from mounting one in the first place, so callers
+    /// giving a weapon should use this to gate the mount itself instead of
+    /// giving a combination the game would immediately have to correct.
+    ///
+    /// `affinity_id` is this weapon id's own affinity digit (see
+    /// [`gem_check_affinity_id`](Self::gem_check_affinity_id)) and
+    /// `max_gem_rank` is `ReinforceParamWeapon::enable_gem_rank` for this
+    /// weapon's `reinforce_type_id` row — both keyed differently than this
+    /// struct itself, so resolving them is left to the caller (e.g.
     /// [`EquipGameData::give_item`](crate::cs::EquipGameData::give_item)).
     ///
     /// Checks, in order:
     /// - This weapon has a gem slot at all (`gem_mount_type` 1 or 2).
-    /// - The gem's `can_mount_wep_*` flag for this weapon's `wep_type` is set
-    ///   (`CheckIfWepTypeCanEquipGem`, `0x140d29e00`).
+    /// - The gem's `can_mount_wep_*` flag for this weapon's `wep_type` is set.
     /// - The affinity is one the gem supports. Infusing *is* mounting an ash,
     ///   so which affinities a weapon can take is a property of the gem, not
     ///   the weapon: each gem carries a 24-bit `configurable_wep_attr`
@@ -47,24 +58,8 @@ impl EQUIP_PARAM_WEAPON_ST {
     /// Halberd has Charge Forth innately (row `105`, which allows its
     /// `AxhammerLarge` type), while the obtainable Charge Forth (row `10500`)
     /// doesn't allow that type at all — so it can never be infused with its
-    /// own default ash. That falls out of the `wep_type` check above with no
+    /// own default ash. That falls out of the `wep_type` check with no
     /// special-casing.
-    /// The affinity id the gem check runs against, for a weapon given by its
-    /// **full** param id (`base + affinity * 100 + reinforce_level`) — mirrors
-    /// the real `GetLockedAffinityIdForGemCheck` (`0x140d545b0`), which reads
-    /// `(paramId % 10000) / 100` and returns `0` instead whenever the weapon's
-    /// affinity is locked (`disable_gem_attr`).
-    ///
-    /// Takes the full id rather than the `+0` base: `% 10000` is what isolates
-    /// the affinity and reinforcement digits, so rounding the level off first
-    /// is a different operation that only coincidentally agrees.
-    pub fn gem_check_affinity_id(&self, weapon_param_id: u32) -> u32 {
-        if self.disable_gem_attr() {
-            return 0;
-        }
-        (weapon_param_id % 10000) / 100
-    }
-
     pub fn can_mount_gem(
         &self,
         gem: &EQUIP_PARAM_GEM_ST,
@@ -101,9 +96,9 @@ impl EQUIP_PARAM_GEM_ST {
     /// infusing, as opposed to [`default_wep_attr`](Self::default_wep_attr),
     /// the single one it lands on by default.
     ///
-    /// Mirrors the real `EquipParamGem::IsAffinityConfigurable`
-    /// (`0x140d2a4d0`), which reads the same 24 flags into a stack array and
-    /// indexes it, returning `false` for anything outside `0..24`.
+    /// Mirrors `EquipParamGem::IsAffinityConfigurable`, which reads the same
+    /// 24 flags into a stack array and indexes it, returning `false` for
+    /// anything outside `0..24`.
     pub fn is_affinity_configurable(&self, affinity_id: u32) -> bool {
         match affinity_id {
             0 => self.configurable_wep_attr00(),
@@ -135,8 +130,7 @@ impl EQUIP_PARAM_GEM_ST {
     }
 
     /// `can_mount_wep_*` selected by `EQUIP_PARAM_WEAPON_ST::wep_type`,
-    /// matching the real `CheckIfWepTypeCanEquipGem`'s (`0x140d29e00`)
-    /// switch.
+    /// matching `CheckIfWepTypeCanEquipGem`'s switch.
     fn can_mount_wep_type(&self, wep_type: u16) -> bool {
         match wep_type {
             1 => self.can_mount_wep_dagger(),

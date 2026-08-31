@@ -1154,6 +1154,19 @@ pub struct EquipInventoryData {
     unk124: u32,
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct AddedItem {
+    /// Falls short of the requested quantity when the stack, the inventory or
+    /// the gaitem pool filled up.
+    pub quantity: u32,
+    /// Slots now holding the item: one for a stacking item, one per copy
+    /// otherwise.
+    pub slots: Vec<u32>,
+    /// `slots.len()` when the entries are new, `0` when an existing stack was
+    /// topped up.
+    pub created_entries: u32,
+}
+
 /// Weapon category value for arrows, the only weapon-category items that
 /// stack. Source: `EQUIP_PARAM_WEAPON_ST::weapon_category`.
 const WEAPON_CATEGORY_ARROW: u8 = 0xd;
@@ -1173,7 +1186,10 @@ impl EquipInventoryData {
     /// it (`GetQuantityByItemId` and `AdjustQuantityBy` both iterate
     /// `idx < itemEntriesCount + 1`). Leave it stale and an entry written
     /// past the mark is physically present but invisible to those lookups.
-    pub fn insert_entry(
+    ///
+    /// Takes ownership of the entry's [`GaitemHandle`], so
+    /// [`add_item`](Self::add_item) is the way in from outside the crate.
+    pub(crate) fn insert_entry(
         &mut self,
         entry: EquipInventoryDataListEntry,
         is_key_item: bool,
@@ -1197,7 +1213,10 @@ impl EquipInventoryData {
     /// down by exactly one rather than rescanning for the next occupied
     /// slot, so after removals the mark is an upper bound rather than a
     /// tight maximum. Every scan it bounds null-checks each entry anyway.
-    pub fn remove_entry(&mut self, slot: u32) -> Option<GaitemHandle> {
+    ///
+    /// Hands back the entry's [`GaitemHandle`] for the caller to release, so
+    /// [`remove_item`](Self::remove_item) is the way in from outside the crate.
+    pub(crate) fn remove_entry(&mut self, slot: u32) -> Option<GaitemHandle> {
         let handle = self.items_data.remove_entry(slot)?;
 
         if slot == self.highest_item_slot {
@@ -1313,7 +1332,7 @@ impl EquipInventoryData {
     /// [`unlimited_consumables`](Self::unlimited_consumables), which is what
     /// the storage box sets.
     ///
-    /// Mirrors `GetMaxItemCountForUnlimitedConsumables` (`0x1406748c0`).
+    /// Mirrors `GetMaxItemCountForUnlimitedConsumables`.
     /// Despite the name it isn't a blanket "unlimited": each category answers
     /// differently, and only ammo and Goods stack meaningfully.
     fn unlimited_consumables_max_stack(&self, item_id: ItemId) -> u32 {
@@ -1344,24 +1363,11 @@ impl EquipInventoryData {
         }
     }
 
-    /// Gives `quantity` more of the stackable item `item_id`, merging into an
-    /// existing entry if present or creating a new one otherwise, clamped to
-    /// [max_stack_for](Self::max_stack_for). Returns the quantity actually
-    /// added, which may be less than `quantity` (including 0) if the stack or
-    /// inventory is full — unlike the game, this never spawns a world item
-    /// drop for any remainder.
-    ///
-    /// `item_id` must be [is_stackable](Self::is_stackable). `gaitem_handle`
-    /// is only used when creating a new entry (the existing entry's handle is
-    /// reused when merging), and its ref count isn't adjusted by this method.
-    ///
-    /// Mirrors `AddInventoryEquip`'s stackable branch and
-    /// `AdjustQuantityBy`/`GetAddOrRemoveAmount`.
     /// How many more of `item_id` can actually be added, accounting for what's
     /// already held.
     ///
     /// [`max_stack_for`](Self::max_stack_for) answers two different questions
-    /// depending on the item, matching `GetMaxAmountForItem` (`0x14024e570`):
+    /// depending on the item, matching `GetMaxAmountForItem`:
     /// for a pot-group item under `limited_pots` it already returns the
     /// group's *remaining headroom*, while for everything else it returns a
     /// per-entry *stack ceiling*. Subtracting the entry's own quantity is
@@ -1388,128 +1394,134 @@ impl EquipInventoryData {
         max.saturating_sub(held)
     }
 
-    /// Adds `quantity` to the stack already held at `slot`, capped at the
-    /// item's maximum stack size. Returns how many were actually added.
+    /// Adds up to `quantity` of `item_id`, clamped to
+    /// [`headroom_for`](Self::headroom_for) and the free slots, so
+    /// [`u32::MAX`] fills the stack. [`is_stackable`](Self::is_stackable) items
+    /// merge into an existing entry; everything else takes one entry per copy.
     ///
-    /// Mirrors `EquipInventoryData::AdjustQuantityBy`, the branch
-    /// `AddInventoryEquip` takes for a stackable item that's already owned —
-    /// no new inventory entry, and no new gaitem, since the existing entry's
-    /// handle continues to back the whole stack.
-    pub fn add_to_stack(&mut self, item_id: ItemId, slot: u32, quantity: u32) -> u32 {
+    /// Mirrors `EquipInventoryData::InsertItem`, resolving gaitem handles the
+    /// way `AddInventoryEquipByItemId` does.
+    /// Carries none of the player-side bookkeeping
+    /// [`EquipGameData::give_item`](crate::cs::EquipGameData::give_item) adds,
+    /// which is what lets it also serve the storage box — where the caps come
+    /// from `maxRepositoryNum` instead of `maxNum`.
+    pub fn add_item(&mut self, item_id: ItemId, quantity: u32) -> AddedItem {
         if quantity == 0 {
-            return 0;
+            return AddedItem::default();
         }
 
-        let headroom = self.headroom_for(item_id, Some(slot));
-
-        let Some(entry) = self
-            .items_data
-            .entry_at_slot_mut(slot)
-            .and_then(|e| e.as_option_mut())
-        else {
-            return 0;
-        };
-
-        let added = headroom.min(quantity);
-        entry.quantity += added;
-
-        if added > 0 {
-            let pot_group = entry.pot_group;
-            if pot_group >= 0 {
-                self.pot_items_count[pot_group as usize] += added;
-            }
-        }
-
-        added
-    }
-
-    pub fn give_stackable(
-        &mut self,
-        item_id: ItemId,
-        quantity: u32,
-        gaitem_handle: GaitemHandle,
-    ) -> u32 {
-        if quantity == 0 {
-            return 0;
-        }
-
-        if let Some(slot) = self.items_data.find_item_idx(item_id) {
-            let headroom = self.headroom_for(item_id, Some(slot));
+        if Self::is_stackable(item_id)
+            && let Some(slot) = self.items_data.find_item_idx(item_id)
+        {
+            let added = self.headroom_for(item_id, Some(slot)).min(quantity);
             let Some(entry) = self
                 .items_data
                 .entry_at_slot_mut(slot)
                 .and_then(|e| e.as_option_mut())
             else {
-                return 0;
+                return AddedItem::default();
             };
 
-            let added = headroom.min(quantity);
             entry.quantity += added;
-
-            if added > 0 {
-                let pot_group = entry.pot_group;
-                if pot_group >= 0 {
-                    self.pot_items_count[pot_group as usize] += added;
-                }
-            }
-
-            added
-        } else {
-            let added = self.headroom_for(item_id, None).min(quantity);
-            if added == 0 {
-                return 0;
-            }
-
-            let pot_group = Self::pot_group_for(item_id);
-            let sort_id = self.next_sort_id;
-            self.next_sort_id += 1;
-
-            let is_key_item = Self::is_key_item(item_id);
-            let inserted = self.insert_entry(
-                EquipInventoryDataListEntry {
-                    gaitem_handle,
-                    item_id: item_id.into(),
-                    quantity: added,
-                    sort_id,
-                    is_new: true,
-                    pot_group,
-                },
-                is_key_item,
-            );
-
-            if inserted.is_none() {
-                return 0;
-            }
-
-            if pot_group >= 0 {
+            let pot_group = entry.pot_group;
+            if added > 0 && pot_group >= 0 {
                 self.pot_items_count[pot_group as usize] += added;
             }
+            return AddedItem {
+                quantity: added,
+                slots: vec![slot],
+                created_entries: 0,
+            };
+        }
 
-            added
+        if Self::is_stackable(item_id) {
+            let wanted = self.headroom_for(item_id, None).min(quantity);
+            return match self.insert_new_entry(item_id, wanted) {
+                Some((_, slot)) => AddedItem {
+                    quantity: wanted,
+                    slots: vec![slot],
+                    created_entries: 1,
+                },
+                None => AddedItem::default(),
+            };
+        }
+
+        // One entry per copy, each with its own handle, until the inventory
+        // runs out of slots.
+        let mut slots = Vec::new();
+        while (slots.len() as u32) < quantity
+            && let Some((_, slot)) = self.insert_new_entry(item_id, 1)
+        {
+            slots.push(slot);
+        }
+
+        AddedItem {
+            quantity: slots.len() as u32,
+            created_entries: slots.len() as u32,
+            slots,
         }
     }
 
-    /// Removes up to `quantity` of the stackable item `item_id`, clearing its
-    /// entry (via [`InventoryItemsData::remove_entry`]) if the stack reaches
-    /// zero. Returns the quantity actually removed and, if the entry was
-    /// cleared, the [`GaitemHandle`] it held so the caller can release it.
-    ///
-    /// Mirrors the negative-quantity branch of `GetAddOrRemoveAmount` and
-    /// `AdjustItemCountByIndex`.
-    pub fn take_stackable(
+    /// Creates one entry holding `quantity` of `item_id`, allocating the gaitem
+    /// handle it takes ownership of. Returns the entry's handle and slot, or
+    /// `None` if the inventory or gaitem pool was full.
+    pub(crate) fn insert_new_entry(
         &mut self,
         item_id: ItemId,
         quantity: u32,
-    ) -> (u32, Option<GaitemHandle>) {
+    ) -> Option<(GaitemHandle, u32)> {
+        if quantity == 0 {
+            return None;
+        }
+
+        let Ok(gaitem) = (unsafe { crate::cs::CSGaitemImp::instance_mut() }) else {
+            return None;
+        };
+        let gaitem_handle = gaitem.allocate_for_item(item_id)?;
+
+        let pot_group = Self::pot_group_for(item_id);
+        let sort_id = self.next_sort_id;
+        self.next_sort_id += 1;
+
+        let is_key_item = Self::is_key_item(item_id);
+        let Some(slot) = self.insert_entry(
+            EquipInventoryDataListEntry {
+                gaitem_handle,
+                item_id: item_id.into(),
+                quantity,
+                sort_id,
+                is_new: true,
+                pot_group,
+            },
+            is_key_item,
+        ) else {
+            gaitem.release_handle(gaitem_handle);
+            return None;
+        };
+
+        if pot_group >= 0 {
+            self.pot_items_count[pot_group as usize] += quantity;
+        }
+
+        Some((gaitem_handle, slot))
+    }
+
+    /// Removes up to `quantity` of `item_id`, clearing its entry and releasing
+    /// the [`GaitemHandle`] if the stack reaches zero. Returns how many were
+    /// removed.
+    ///
+    /// Mirrors the negative-quantity branch of `GetAddOrRemoveAmount` and
+    /// `AdjustItemCountByIndex`.
+    pub fn remove_item(&mut self, item_id: ItemId, quantity: u32) -> u32 {
         let Some(slot) = self.items_data.find_item_idx(item_id) else {
-            return (0, None);
+            return 0;
         };
         let Some(entry) = self
             .items_data
             .entry_at_slot_mut(slot)
             .and_then(|e| e.as_option_mut())
         else {
-            return (0, None);
+            return 0;
         };
 
         let removed = quantity.min(entry.quantity);
@@ -1521,12 +1533,14 @@ impl EquipInventoryData {
                 self.pot_items_count[pot_group as usize].saturating_sub(removed);
         }
 
-        if entry.quantity == 0 {
-            let handle = self.remove_entry(slot);
-            (removed, handle)
-        } else {
-            (removed, None)
+        if entry.quantity == 0
+            && let Some(handle) = self.remove_entry(slot)
+            && let Ok(gaitem) = unsafe { crate::cs::CSGaitemImp::instance_mut() }
+        {
+            gaitem.release_handle(handle);
         }
+
+        removed
     }
 
     /// The pot group of `item_id`, or -1 if it's not part of one.

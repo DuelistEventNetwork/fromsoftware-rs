@@ -5,8 +5,8 @@ use pelite::pe::Pe;
 
 use crate::cs::{
     CSGaitemImp, CSMenuManImp, ChrAsmArmStyle, ChrAsmSlot, EquipDataItem, EquipGameData,
-    EquipInventoryData, EquipInventoryDataListEntry, EquipParamGem, EquipParamWeapon,
-    GaitemCategory, GaitemHandle, GameDataMan, ItemCategory, ItemId, ItemIdError, OptionalItemId,
+    EquipInventoryData, EquipParamGem, EquipParamWeapon,
+    GaitemHandle, GameDataMan, ItemCategory, ItemId, ItemIdError, OptionalItemId,
     ReinforceParamWeapon, SoloParamRepository,
 };
 use crate::rva;
@@ -28,6 +28,9 @@ pub enum GiveItemError {
 pub enum GiveItemRequest {
     Weapon {
         param_id: u32,
+        /// Only honoured for arrows and bolts, the sole stacking weapons.
+        /// Anything else occupies one entry per copy and gives a single item.
+        quantity: Option<u32>,
         ash_of_war_param_id: Option<u32>,
     },
     Protector {
@@ -66,109 +69,107 @@ impl GiveItemRequest {
     }
 }
 
-/// The outcome of a successful [`EquipGameData::give_item`] call.
 pub struct GaveItem {
-    /// How many were actually given. Always 0 or 1 for
-    /// [`Weapon`]/[`Protector`]/[`Accessory`], possibly more for
-    /// [`Goods`] (and possibly less than the
-    /// requested quantity, if the inventory/stack was full).
-    ///
-    /// [`Weapon`]: GiveItemRequest::Weapon
-    /// [`Protector`]: GiveItemRequest::Protector
-    /// [`Accessory`]: GiveItemRequest::Accessory
-    /// [`Goods`]: GiveItemRequest::Goods
+    /// Falls short of the requested quantity when the stack, the inventory or
+    /// the gaitem pool filled up.
     pub quantity: u32,
-    /// For [`Weapon`]/[`Protector`]/[`Accessory`] requests: the
-    /// exact new copy's [`GaitemHandle`] and inventory slot.
-    ///
-    /// [`Weapon`]: GiveItemRequest::Weapon
-    /// [`Protector`]: GiveItemRequest::Protector
-    /// [`Accessory`]: GiveItemRequest::Accessory
-    pub indexed: Option<(GaitemHandle, u32)>,
+    /// Slots now holding the item: one for a stacking item, one per copy
+    /// otherwise.
+    pub slots: Vec<u32>,
+}
+
+impl GaveItem {
+    /// The slot to equip, or `None` if nothing was given.
+    pub fn slot(&self) -> Option<u32> {
+        self.slots.first().copied()
+    }
 }
 
 impl EquipGameData {
+    /// Gives an item and mounts its ash of war.
+    ///
+    /// [`EquipInventoryData::add_item`] does the inventory work; this adds what
+    /// `AddInventoryEquip` does over `InsertItem` — marking the
+    /// item acquired and raising the matchmaking weapon level.
     pub fn give_item(&mut self, request: GiveItemRequest) -> Result<GaveItem, GiveItemError> {
         let gaitem = unsafe { CSGaitemImp::instance_mut() }
             .map_err(|_| GiveItemError::GaitemSingletonUnavailable)?;
 
         let item_id = request.item_id()?;
-        if EquipInventoryData::is_stackable(item_id)
-            && let Some(slot) = self.equip_inventory_data.items_data.find_item_idx(item_id)
-        {
-            let quantity = match request {
-                GiveItemRequest::Goods { quantity, .. } => quantity,
-                _ => 1,
-            };
-            let added = self
-                .equip_inventory_data
-                .add_to_stack(item_id, slot, quantity);
-            if added > 0 {
-                self.mark_item_acquired(item_id);
-            }
-            return Ok(GaveItem {
-                quantity: added,
-                indexed: None,
-            });
-        }
+        let quantity = match request {
+            GiveItemRequest::Goods { quantity, .. } => quantity,
+            GiveItemRequest::Weapon { quantity, .. } => quantity.unwrap_or(1),
+            _ => 1,
+        };
 
-        match request {
-            GiveItemRequest::Goods { .. } => {
-                let item_id = request.item_id()?;
-                let GiveItemRequest::Goods { quantity, .. } = request else {
-                    unreachable!()
-                };
-                Ok(GaveItem {
-                    quantity: self.give_goods(item_id, quantity, gaitem),
-                    indexed: None,
-                })
-            }
+        let (item_id, ash_of_war_param_id) = match request {
             GiveItemRequest::Weapon {
                 ash_of_war_param_id,
                 ..
-            } => {
-                let item_id = request.item_id()?;
-                let indexed = self.give_weapon_indexed(item_id, ash_of_war_param_id, gaitem);
-                Ok(GaveItem {
-                    quantity: indexed.is_some() as u32,
-                    indexed,
-                })
-            }
-            GiveItemRequest::Protector { .. } | GiveItemRequest::Accessory { .. } => {
-                let item_id = request.item_id()?;
-                let indexed = self.give_indexed_item(item_id, gaitem);
-                Ok(GaveItem {
-                    quantity: indexed.is_some() as u32,
-                    indexed,
-                })
+            } => Self::resolve_weapon(item_id, ash_of_war_param_id),
+            _ => (item_id, None),
+        };
+
+        self.heal_next_sort_id();
+
+        let added = self.equip_inventory_data.add_item(item_id, quantity);
+        if added.quantity == 0 {
+            return Ok(GaveItem {
+                quantity: 0,
+                slots: Vec::new(),
+            });
+        }
+
+        // A topped-up stack isn't new to the player.
+        if added.created_entries > 0 {
+            for slot in &added.slots {
+                self.add_recent_item_index(*slot);
             }
         }
+
+        // Each copy carries its own ash.
+        if let Some(ash_param_id) = ash_of_war_param_id
+            && let Ok(ash_item_id) = ItemId::new(ItemCategory::Gem, ash_param_id)
+        {
+            for slot in &added.slots {
+                let Some(weapon_handle) = self
+                    .equip_inventory_data
+                    .items_data
+                    .entry_at_slot(*slot)
+                    .and_then(|entry| entry.as_option())
+                    .map(|entry| entry.gaitem_handle)
+                else {
+                    continue;
+                };
+                let Some(ash_handle) = gaitem.allocate_indexed_gaitem(ash_item_id) else {
+                    break;
+                };
+                gaitem.equip_ash_of_war(weapon_handle, ash_handle);
+            }
+        }
+
+        self.mark_item_acquired(item_id);
+        if item_id.category() == ItemCategory::Weapon {
+            self.update_matching_weapon_level(item_id);
+        }
+
+        Ok(GaveItem {
+            quantity: added.quantity,
+            slots: added.slots,
+        })
     }
 
-    fn give_weapon_indexed(
-        &mut self,
-        item_id: ItemId,
-        ash_of_war_param_id: Option<u32>,
-        gaitem: &mut CSGaitemImp,
-    ) -> Option<(GaitemHandle, u32)> {
+    /// The weapon id to give and the ash to mount on it. Drops the affinity
+    /// when the ash isn't valid for the weapon, since the game has no infused
+    /// weapon without one.
+    fn resolve_weapon(item_id: ItemId, ash_of_war_param_id: Option<u32>) -> (ItemId, Option<u32>) {
         let ash_of_war_param_id =
             ash_of_war_param_id.filter(|ash| Self::is_ash_of_war_valid_for_weapon(item_id, *ash));
 
-        let item_id = match ash_of_war_param_id {
-            Some(_) => item_id,
-            None => Self::without_affinity(item_id).unwrap_or(item_id),
-        };
-
-        let given = self.give_indexed_item(item_id, gaitem)?;
-
-        if let Some(ash_param_id) = ash_of_war_param_id
-            && let Ok(ash_item_id) = ItemId::new(ItemCategory::Gem, ash_param_id)
-            && let Some(ash_handle) = gaitem.allocate_indexed_gaitem(ash_item_id)
-        {
-            gaitem.equip_ash_of_war(given.0, ash_handle);
+        match ash_of_war_param_id {
+            Some(_) => (item_id, ash_of_war_param_id),
+            None => (Self::without_affinity(item_id).unwrap_or(item_id), None),
         }
-
-        Some(given)
     }
 
     fn without_affinity(item_id: ItemId) -> Option<ItemId> {
@@ -200,89 +201,6 @@ impl EquipGameData {
             .unwrap_or(0);
 
         weapon.can_mount_gem(gem, affinity_id, max_gem_rank)
-    }
-
-    fn give_goods(&mut self, item_id: ItemId, quantity: u32, gaitem: &mut CSGaitemImp) -> u32 {
-        if quantity == 0 {
-            return 0;
-        }
-
-        if EquipInventoryData::is_stackable(item_id) {
-            let Some(handle) = Self::allocate_gaitem_for_give(item_id, gaitem) else {
-                return 0;
-            };
-
-            let given = self
-                .equip_inventory_data
-                .give_stackable(item_id, quantity, handle);
-            if given > 0 {
-                self.mark_item_acquired(item_id);
-            }
-            given
-        } else {
-            let mut given = 0;
-            for _ in 0..quantity {
-                if self.give_indexed_item(item_id, gaitem).is_none() {
-                    break;
-                }
-                given += 1;
-            }
-            given
-        }
-    }
-
-    fn allocate_gaitem_for_give(item_id: ItemId, gaitem: &mut CSGaitemImp) -> Option<GaitemHandle> {
-        match item_id.category() {
-            ItemCategory::Goods => {
-                Some(gaitem.allocate_partial_gaitem(GaitemCategory::Goods, item_id.param_id()))
-            }
-            ItemCategory::Accessory => {
-                Some(gaitem.allocate_partial_gaitem(GaitemCategory::Accessory, item_id.param_id()))
-            }
-            ItemCategory::Weapon | ItemCategory::Protector | ItemCategory::Gem => {
-                gaitem.allocate_indexed_gaitem(item_id)
-            }
-        }
-    }
-
-    fn give_indexed_item(
-        &mut self,
-        item_id: ItemId,
-        gaitem: &mut CSGaitemImp,
-    ) -> Option<(GaitemHandle, u32)> {
-        let handle = Self::allocate_gaitem_for_give(item_id, gaitem)?;
-
-        self.heal_next_sort_id();
-        let sort_id = self.equip_inventory_data.next_sort_id;
-        self.equip_inventory_data.next_sort_id += 1;
-
-        let is_key_item = EquipInventoryData::is_key_item(item_id);
-        let inserted = self.equip_inventory_data.insert_entry(
-            EquipInventoryDataListEntry {
-                gaitem_handle: handle,
-                item_id: item_id.into(),
-                quantity: 1,
-                sort_id,
-                is_new: true,
-                pot_group: -1,
-            },
-            is_key_item,
-        );
-
-        match inserted {
-            Some(slot) => {
-                self.mark_item_acquired(item_id);
-                self.add_recent_item_index(slot);
-                if item_id.category() == ItemCategory::Weapon {
-                    self.update_matching_weapon_level(item_id);
-                }
-                Some((handle, slot))
-            }
-            None => {
-                gaitem.release_handle(handle);
-                None
-            }
-        }
     }
 
     fn heal_next_sort_id(&mut self) {
@@ -406,13 +324,7 @@ impl EquipGameData {
                 self.clear_references_to_slot(gaitem, slot);
             }
 
-            let (removed, freed_handle) =
-                self.equip_inventory_data.take_stackable(item_id, quantity);
-
-            if let Some(handle) = freed_handle {
-                gaitem.release_handle(handle);
-            }
-            removed
+            self.equip_inventory_data.remove_item(item_id, quantity)
         } else {
             let mut removed = 0;
             for _ in 0..quantity {
@@ -477,7 +389,7 @@ impl EquipGameData {
     /// Tells other players in the session that this character's equipment
     /// changed, so they render the new loadout.
     ///
-    /// Calls `BroadcastPacket12CharacterData` (`0x140ca11c0`), which fills a
+    /// Calls `BroadcastPacket12CharacterData`, which fills a
     /// packet from the main player's equipment and hands it to
     /// `CSSessionManagerImp::P2PBroadcast`. The real equip, unequip and
     /// item-removal paths all reach this; without it remote players keep
@@ -508,7 +420,7 @@ impl EquipGameData {
     /// Re-points the selected quick slot when the item behind it moved.
     ///
     /// Mirrors `CS::EquipGameData::RevalidateSelectedQuickSlot`
-    /// (`0x140249a90`). `selected_quick_slot` holds a slot position, not an
+    ///. `selected_quick_slot` holds a slot position, not an
     /// inventory index, so the item is resolved through the slot first: if it
     /// still occupies a slot nothing changes, otherwise the same position is
     /// reused when something else moved into it, and failing that the search
@@ -541,7 +453,7 @@ impl EquipGameData {
 
     /// The inventory index the selected slot points at.
     ///
-    /// Mirrors `EquipItemData::GetSelectedQuickslotItemIndex` (`0x14024f410`).
+    /// Mirrors `EquipItemData::GetSelectedQuickslotItemIndex`.
     fn selected_quick_slot_item_index(&self) -> i32 {
         match self.selected_quick_slot_position() {
             Some(position) => self.equip_item_data.quick_slots[position].index,
@@ -552,7 +464,7 @@ impl EquipGameData {
     /// The position of the slot holding `item_index`.
     ///
     /// Mirrors `EquipItemData::GetQuickSlotIndexByInventoryIndex`
-    /// (`0x14024f2c0`).
+    ///.
     fn quick_slot_position_of(&self, item_index: i32) -> Option<usize> {
         if item_index == -1 {
             return None;
@@ -566,8 +478,8 @@ impl EquipGameData {
     /// Moves the selection to the next occupied slot after `from`, wrapping,
     /// or clears it when every slot is empty.
     ///
-    /// Mirrors `EquipItemData::SelectNextOccupiedQuickSlot` (`0x14024f7e0`)
-    /// and `FindNextOccupiedQuickSlot` (`0x1402501a0`): the search starts at
+    /// Mirrors `EquipItemData::SelectNextOccupiedQuickSlot`
+    /// and `FindNextOccupiedQuickSlot`: the search starts at
     /// `from + 1` and wraps, and an unset selection starts from the last slot
     /// so the scan begins at position 0.
     fn select_next_occupied_quick_slot(&mut self, from: Option<usize>) {
@@ -607,38 +519,9 @@ impl EquipGameData {
     /// `slot`, unequipping whatever's already there first if the slot is
     /// occupied. A no-op if `inventory_slot` doesn't hold a real entry.
     ///
-    /// **Deliberately separate from [`give_item`](Self::give_item)** — an
-    /// explicit second step the caller must take after giving an item, not
-    /// something `give_item` does as a side effect, mirroring the real
-    /// game's own give/equip split (`AddInventoryEquip`/`UpdateAutoEquip`
-    /// only auto-equip a narrow set of cases — arrow/bolt weapons, quick-slot
-    /// goods — everything else needs an explicit equip action).
-    ///
-    /// Mirrors the real equip chain traced via Ghidra
-    /// (`pc_eldenring_runtime.1.16.2.exe`): `EquipItemStruct::EquipItem`
-    /// (`0x1407a3320`, the menu's top-level equip action) →
-    /// `EquipItemToChrAsmSlot` (`0x140787c30`) →
-    /// `CS::EquipGameData::SetEquipmentEntries` (`0x140249160`) →
-    /// `CS::ChrAsm::EquipItem` (`0x1403bf3c0`, invoked via a deferred
-    /// `std::function` `SetEquipmentEntries` constructs and calls inline).
-    /// Confirmed **not** relevant to interactability (traced this session,
-    /// all no-ops or UI/network side effects outside what's covered below):
-    /// `EquipItemToChrAsmSlot`'s own popup-warning pre-check
-    /// (`FUN_140787ab0`, "already equipped elsewhere" dialog),
-    /// `GLOBAL_CSMenuMan`'s last-interacted-item-index field write, a
-    /// per-slot "changed" flag in `EquipGameData` (undocumented, presumably
-    /// VFX/SFX trigger), `BroadCastEquipmentChange` (confirmed multiplayer
-    /// session-only — a no-op with no active session), and `FUN_140249a90`
-    /// (re-validates the *quick-slot* selection index, unrelated to `ChrAsm`
-    /// slots).
-    ///
-    /// The reverse of [`unequip_slot`](Self::unequip_slot): writes real
-    /// values into the same four arrays that method clears, plus
-    /// `CS::ChrAsm::EquipItem`'s two additional real writes for weapon/bolt
-    /// slots (`slot`'s discriminant `< 12`, i.e. `WeaponLeft1..=Bolt3`):
-    /// resetting two-handing back to `OneHanded` if `slot` is the currently
-    /// active weapon slot for either hand, and clearing that slot's
-    /// loaded-bolt/arrow state.
+    /// The reverse of [`unequip_slot`](Self::unequip_slot). Giving an item
+    /// does not equip it, so this is a separate step after
+    /// [`give_item`](Self::give_item).
     pub unsafe fn equip_slot(
         &mut self,
         gaitem: &mut CSGaitemImp,
@@ -696,6 +579,8 @@ impl EquipGameData {
         self.equipment_entries[slot] = item_id.into();
         self.equipment_item_idx_list[slot as usize] = inventory_slot;
 
+        // Weapon and ammo slots (`WeaponLeft1..=Bolt3`) drop two-handing and
+        // whatever was loaded.
         if (slot as usize) < 12 {
             let equipment = &mut self.chr_asm.equipment;
             if slot == equipment.active_left_weapon_slot()
@@ -719,23 +604,10 @@ impl EquipGameData {
     /// Unequips the given [`ChrAsmSlot`], releasing the gaitem handle
     /// reference it held.
     ///
-    /// Mirrors `CS::EquipGameData::UnequipSlot` (`0x140247160`), which does
-    /// **not** treat every slot the same way. Weapon and protector slots are
-    /// never left empty: the game equips a *default* item into them instead —
-    /// unarmed fists (`GetDefaultUnarmedParamId`, `0x140248270` — param id
-    /// [`UNARMED_PARAM_ID`]) for weapon slots, and the bare-skin protector
-    /// rows (`GetDefaultItemIdForEmptyProtectorSlot`, `0x140d473d0` —
-    /// [`EMPTY_PROTECTOR_ITEM_IDS`]) for the four armor slots. Only ammo and
-    /// accessory slots get a true clear (handle `0`, item index `-1`).
-    ///
-    /// Writing an empty handle into a weapon or protector slot instead
-    /// produces a state the game never creates, which the equipment menu then
-    /// renders from stale/mismatched data.
-    ///
-    /// The default item has to be *owned* to be equipped, since the slot
-    /// refers to it by inventory index: the real code looks it up with
-    /// `GetItemInventoryIdx` and, only if it isn't already held, gives it via
-    /// `AddInventoryEquip` first. This does the same.
+    /// Only ammo and accessory slots are truly cleared. Weapon and protector
+    /// slots are never left empty: they get the default item for the slot
+    /// instead, given first if it isn't already owned. Clearing them outright
+    /// is a state the game never produces and the equipment menu misrenders.
     pub unsafe fn unequip_slot(&mut self, gaitem: &mut CSGaitemImp, slot: ChrAsmSlot) {
         if let Some(default_item_id) = Self::default_item_for_empty_slot(slot) {
             let owned = self
@@ -746,7 +618,8 @@ impl EquipGameData {
             let inventory_slot = match owned {
                 Some(inventory_slot) => Some(inventory_slot),
                 None => self
-                    .give_indexed_item(default_item_id, gaitem)
+                    .equip_inventory_data
+                    .insert_new_entry(default_item_id, 1)
                     .map(|(_, inventory_slot)| inventory_slot),
             };
 

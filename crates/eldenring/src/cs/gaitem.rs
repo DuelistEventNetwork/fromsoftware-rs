@@ -138,8 +138,7 @@ impl CSGaitemImp {
         descriptor.unindexed_gaitem_handle = handle.uncategorized();
         descriptor.ref_count = 0;
 
-        // The tail is advanced *before* the write, matching `RemoveCSGaitemIns`
-        // (`0x140672560`):
+        // The tail is advanced *before* the write, matching `RemoveCSGaitemIns`:
         //
         //     uVar2 = (freeTableIdxQueueEndId + 1) % 0x1400;
         //     freeTableIdxQueueEndId = uVar2;
@@ -155,6 +154,24 @@ impl CSGaitemImp {
         // gaitems are still allocated and referenced.
         self.write_index = (self.write_index + 1) % 5120;
         self.indexes[self.write_index as usize] = index;
+    }
+
+    /// Allocates whichever handle kind `item_id`'s category calls for: a bare
+    /// one for Goods and Accessories, an indexed one for the rest.
+    ///
+    /// Mirrors `GetGaitemHandleByItemId`.
+    pub fn allocate_for_item(&mut self, item_id: ItemId) -> Option<GaitemHandle> {
+        match item_id.category() {
+            ItemCategory::Goods => {
+                Some(self.allocate_partial_gaitem(GaitemCategory::Goods, item_id.param_id()))
+            }
+            ItemCategory::Accessory => {
+                Some(self.allocate_partial_gaitem(GaitemCategory::Accessory, item_id.param_id()))
+            }
+            ItemCategory::Weapon | ItemCategory::Protector | ItemCategory::Gem => {
+                self.allocate_indexed_gaitem(item_id)
+            }
+        }
     }
 
     /// Allocates and registers a [`CSGaitemIns`]-family instance of the
@@ -278,15 +295,12 @@ impl CSGaitemImp {
     /// mounted (if any). A no-op if either handle doesn't resolve to a real
     /// [`CSWepGaitemIns`]/[`CSGemGaitemIns`] instance.
     ///
-    /// Reverse-engineered from the real equip-ash-of-war path
-    /// (`FUN_140674300`/`FUN_140673a10`/`FUN_140673820` in
-    /// `pc_eldenring_runtime.1.16.2.exe`): the weapon's single gem slot
-    /// (`gem_slot_table.gem_slots[0]`) holds the ash's [`GaitemHandle`] via
-    /// [`swap_handle`](Self::swap_handle) (never a bare assignment, exactly
-    /// like the real `swapInventoryItemGaItemHandles_` this mirrors), and
-    /// the ash gaitem's own `weapon_handle` back-pointer is set directly (a
-    /// plain field write, not ref-counted, since it's just a back-pointer —
-    /// mirrors `CS::GaitemLookupResult::SetGemOwningWeaponHandle`).
+    /// Follows the game's own equip-ash-of-war path: the weapon's single gem
+    /// slot (`gem_slot_table.gem_slots[0]`) holds the ash's [`GaitemHandle`]
+    /// via [`swap_handle`](Self::swap_handle) rather than a bare assignment,
+    /// and the ash gaitem's own `weapon_handle` back-pointer is set directly
+    /// — a plain field write, not ref-counted, since it's only a
+    /// back-pointer. Mirrors `CS::GaitemLookupResult::SetGemOwningWeaponHandle`.
     pub fn equip_ash_of_war(&mut self, weapon_handle: GaitemHandle, ash_handle: GaitemHandle) {
         let Some(current_ash) = self
             .gaitem_ins_by_handle(&weapon_handle)
@@ -635,8 +649,8 @@ impl CSGaitemGameData {
     /// picked this up" tracker — mirrors `CS::CSGaitemGameData::UpdateItem`
     /// with its `acquired` argument hardcoded `true` (the only way real
     /// `AddInventoryEquip` ever calls it). `gaitem_entries` is kept sorted by
-    /// `item_id`'s raw numeric value (confirmed via decompile: the real
-    /// function binary-searches it), so this finds `item_id`'s insertion
+    /// `item_id`'s raw numeric value — the real function binary-searches it —
+    /// so this finds `item_id`'s insertion
     /// point and either flips an existing entry's `already_acquired` flag or
     /// inserts a fresh `true` entry, shifting every following entry over by
     /// one — [`DLFixedVector`] itself only supports appending, so the shift
