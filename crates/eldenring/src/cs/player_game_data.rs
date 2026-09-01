@@ -1262,8 +1262,18 @@ impl EquipInventoryData {
         let Ok(repo) = (unsafe { SoloParamRepository::instance() }) else {
             return false;
         };
+        const KEY_ITEM: u8 = 0x1;
+        const WONDROUS_PHYSICK_TEAR: u8 = 0xa;
+        const REGENERATIVE_MATERIAL: u8 = 0xb;
+        const GREAT_RUNE: u8 = 0xf;
+
         repo.get::<EquipParamGoods>(item_id.param_id())
-            .map(|goods| goods.is_only_one())
+            .map(|goods| {
+                matches!(
+                    goods.goods_type(),
+                    KEY_ITEM | WONDROUS_PHYSICK_TEAR | REGENERATIVE_MATERIAL | GREAT_RUNE
+                )
+            })
             .unwrap_or(false)
     }
 
