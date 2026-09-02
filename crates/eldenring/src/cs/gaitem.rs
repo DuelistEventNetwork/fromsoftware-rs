@@ -10,7 +10,7 @@ use crate::{
     dlut::DLFixedVector,
     rva,
 };
-use shared::{OwnedPtr, Program, Subclass, Superclass};
+use shared::{FromStatic, OwnedPtr, Program, Subclass, Superclass};
 
 #[repr(C)]
 #[shared::singleton("CSGaitem")]
@@ -156,32 +156,28 @@ impl CSGaitemImp {
         self.indexes[self.write_index as usize] = index;
     }
 
-    /// Allocates whichever handle kind `item_id`'s category calls for: a bare
-    /// one for Goods and Accessories, an indexed one for the rest.
-    ///
-    /// Mirrors `GetGaitemHandleByItemId`.
-    pub fn allocate_for_item(&mut self, item_id: ItemId) -> Option<GaitemHandle> {
+    /// Allocates whichever handle kind `item_id`'s category calls for.
+    pub fn allocate_for(&mut self, item_id: ItemId) -> Option<ItemHandle> {
         match item_id.category() {
-            ItemCategory::Goods => {
-                Some(self.allocate_partial_gaitem(GaitemCategory::Goods, item_id.param_id()))
-            }
-            ItemCategory::Accessory => {
-                Some(self.allocate_partial_gaitem(GaitemCategory::Accessory, item_id.param_id()))
-            }
+            ItemCategory::Goods => Some(ItemHandle::NonIndexed(
+                self.make_goods_handle(GaitemCategory::Goods, item_id.param_id()),
+            )),
+            ItemCategory::Accessory => Some(ItemHandle::NonIndexed(
+                self.make_goods_handle(GaitemCategory::Accessory, item_id.param_id()),
+            )),
             ItemCategory::Weapon | ItemCategory::Protector | ItemCategory::Gem => {
-                self.allocate_indexed_gaitem(item_id)
+                self.allocate_indexed_gaitem(item_id).map(ItemHandle::Indexed)
             }
         }
     }
 
     /// Allocates and registers a [`CSGaitemIns`]-family instance of the
-    /// correct concrete type for `category`, on the game's main heap,
-    /// returning a [`GaitemHandle`] with a starting ref count of 1.
+    /// correct concrete type for `item_id`'s category, on the game's main
+    /// heap, returning a handle with a starting ref count of 1.
     ///
-    /// Only valid for [`GaitemCategory::Weapon`], [`GaitemCategory::Protector`],
-    /// and [`GaitemCategory::Gem`] — the categories backed by a real instance.
-    /// Mirrors `GetGaItemHandleWeapon`/`GetGaItemHandleProtector`/`GetGaItemHandleGem`.
-    pub fn allocate_indexed_gaitem(&mut self, item_id: ItemId) -> Option<GaitemHandle> {
+    /// Only valid for [`ItemCategory::Weapon`], [`ItemCategory::Protector`],
+    /// and [`ItemCategory::Gem`] — the categories backed by a real instance.
+    pub fn allocate_indexed_gaitem(&mut self, item_id: ItemId) -> Option<OwnedGaitemHandle> {
         let category = match item_id.category() {
             ItemCategory::Weapon => GaitemCategory::Weapon,
             ItemCategory::Protector => GaitemCategory::Protector,
@@ -202,25 +198,18 @@ impl CSGaitemImp {
         };
         self.gaitems[index] = Some(stored);
 
-        // `IncreaseGaitemHandleRefCount`, exactly as the real
-        // `GetGaItemHandleWeapon`/`GetGaItemHandleProtector`/
-        // `GetGaItemHandleGem` do after `CheckoutBareGaitemHandle` — an
-        // *increment*, never an assignment. A freshly-freed slot sits at 0, so
-        // this normally lands on 1 either way; the difference matters when the
-        // slot is handed out while a stale handle still references it, where
-        // assigning would silently reset a live count and leave that handle
-        // pointing at a slot now holding a different item.
+        // Increment, never an assignment — a freshly-freed slot sits at 0,
+        // so this normally lands on 1 either way, but assigning would
+        // silently reset a live count if the slot is handed out while a
+        // stale handle still references it.
         self.increase_ref_count(handle);
-        Some(handle)
+        Some(OwnedGaitemHandle(handle))
     }
 
-    /// Builds a [`GaitemHandle`] for a non-indexed category
-    /// ([`GaitemCategory::Goods`] or [`GaitemCategory::Accessory`]), which
-    /// isn't backed by a [`CSGaitemIns`] and requires no heap allocation.
-    ///
-    /// Mirrors `GetGaItemHandleGoods`/`GetGaItemHandleAccessory` via
-    /// `MakeBareGaitemHandle`.
-    pub fn allocate_partial_gaitem(&self, category: GaitemCategory, param_id: u32) -> GaitemHandle {
+    /// Builds a handle for a non-indexed category ([`GaitemCategory::Goods`]
+    /// or [`GaitemCategory::Accessory`]), which isn't backed by a
+    /// [`CSGaitemIns`] and carries no reference to release.
+    pub fn make_goods_handle(&self, category: GaitemCategory, param_id: u32) -> GaitemHandle {
         GaitemHandle::from_parts(param_id, category)
     }
 
@@ -468,6 +457,72 @@ impl GaitemHandle {
 
     pub fn category(self) -> Result<GaitemCategory, GaitemHandleError> {
         GaitemCategory::try_from(self.category_raw())
+    }
+}
+
+/// A handle freshly allocated for an item, typed by whether it needs a
+/// release: [`GaitemCategory::Goods`]/[`GaitemCategory::Accessory`] carry no
+/// reference, everything else does.
+pub enum ItemHandle {
+    NonIndexed(GaitemHandle),
+    Indexed(OwnedGaitemHandle),
+}
+
+/// An owned reference on an indexed gaitem handle, held between allocation
+/// and placement. Dropping it without [`install`](Self::install) or
+/// [`release`](Self::release) still releases it — never construct one for a
+/// non-indexed handle, which has no reference to release.
+#[must_use]
+pub struct OwnedGaitemHandle(GaitemHandle);
+
+impl OwnedGaitemHandle {
+    pub fn install(self, gaitem: &mut CSGaitemImp, slot: &mut GaitemHandle) {
+        gaitem.swap_handle(slot, self.0);
+        std::mem::forget(self);
+    }
+
+    pub fn release(self, gaitem: &mut CSGaitemImp) {
+        gaitem.release_handle(self.0);
+        std::mem::forget(self);
+    }
+
+    /// Hands back the bare handle, keeping its reference alive without
+    /// releasing or installing it. Only for a caller about to store it
+    /// somewhere that isn't a single `&mut GaitemHandle` field — an entry
+    /// being written into a container, for instance — where the resulting
+    /// struct itself becomes the thing responsible for the reference.
+    pub fn into_raw(self) -> GaitemHandle {
+        let handle = self.0;
+        std::mem::forget(self);
+        handle
+    }
+}
+
+impl Drop for OwnedGaitemHandle {
+    fn drop(&mut self) {
+        if let Ok(gaitem) = unsafe { CSGaitemImp::instance_mut() } {
+            gaitem.release_handle(self.0);
+        }
+    }
+}
+
+/// A handle borrowed from a live struct field. [`get`](Self::get) reads it
+/// freely; [`to_owned`](Self::to_owned) is the only way to take a reference
+/// on it.
+pub struct GaitemHandleRef<'a>(&'a GaitemHandle);
+
+impl<'a> GaitemHandleRef<'a> {
+    pub fn new(handle: &'a GaitemHandle) -> Self {
+        Self(handle)
+    }
+
+    pub fn get(&self) -> GaitemHandle {
+        *self.0
+    }
+
+    pub fn to_owned(&self, gaitem: &mut CSGaitemImp) -> OwnedGaitemHandle {
+        gaitem.increase_ref_count(*self.0);
+        OwnedGaitemHandle(*self.0)
     }
 }
 

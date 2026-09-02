@@ -189,7 +189,7 @@ impl ItemId {
     }
 
     /// For a [Weapon](ItemCategory::Weapon) ID, returns its reinforcement
-    /// (upgrade) level, 0–25. Weapon param rows are laid out as
+    /// (upgrade) level, 0-25. Weapon param rows are laid out as
     /// `base_param_id * 100 + level`, so this is simply [param_id](Self::param_id)
     /// modulo 100 — confirmed against real weapon IDs and their independently
     /// known upgrade levels (e.g. a param ID ending in `...24` is level 24).
