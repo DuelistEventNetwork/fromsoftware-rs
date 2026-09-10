@@ -2,10 +2,10 @@ use hudhook::imgui::{TableColumnSetup, Ui};
 
 use debug::UiExt;
 use eldenring::cs::{
-    BreakInAreaList, BreakInData, BreakInManager, BreakInTarget, CSBattleRoyalContext,
-    CSNetBloodMessageDb, CSNetBloodMessageDbItem, CSNetMan, CSQuickMatchContext,
-    CSQuickMatchingCtrl, QuickMatchBattleSessiontData, QuickmatchManager,
-    QuickmatchManagerDebugSettings, QuickmatchParticipant, QuickmatchSpawnData,
+    BreakInAreaList, BreakInManager, BreakInTarget, CSBattleRoyalContext, CSNetBloodMessageDb,
+    CSNetBloodMessageDbItem, CSNetMan, CSQuickMatchContext, CSQuickMatchingCtrl, JoinSessionData,
+    QuickMatchBattleSessiontData, QuickmatchManager, QuickmatchManagerDebugSettings,
+    QuickmatchParticipant, QuickmatchSpawnData,
 };
 
 use super::{DebugDisplay, DisplayUiExt};
@@ -85,7 +85,7 @@ impl DebugDisplay for BreakInAreaList {
     }
 }
 
-impl DebugDisplay for BreakInData {
+impl DebugDisplay for JoinSessionData {
     fn render_debug(&self, ui: &Ui) {
         ui.display("Block ID", self.block_id);
         ui.nested("Block Position", self.block_pos);
@@ -93,6 +93,7 @@ impl DebugDisplay for BreakInData {
         ui.debug("Summon Param Type", self.summon_param_type);
         ui.debug("Multi Play Role", self.multiplay_role);
         ui.display("Has Password", self.has_password);
+        ui.display("Use Rapid Reentry", self.use_rapid_reentry);
     }
 }
 

@@ -112,14 +112,14 @@ pub struct CSNetBloodMessageDbItem {
 }
 
 #[repr(C)]
-pub struct BreakInData {
+pub struct JoinSessionData {
     pub block_id: BlockId,
     pub block_pos: BlockPosition,
     pub entryfilelist_id: i32,
     pub summon_param_type: SummonParamType,
     pub multiplay_role: MultiplayRole,
     pub has_password: bool,
-    unk1e: u8,
+    pub use_rapid_reentry: u8,
     pub join_data: FNVector<u8>,
 }
 
@@ -157,7 +157,7 @@ pub struct BreakInManager {
     pub targets: FNVector<BreakInTarget>,
     unk20: FNVector<()>,
     /// Data from breakin push
-    pub data: BreakInData,
+    pub data: JoinSessionData,
     pub point_manager: BreakInPointManager,
     rebreakin_pos_step: usize,
     pub error_code: i32,
