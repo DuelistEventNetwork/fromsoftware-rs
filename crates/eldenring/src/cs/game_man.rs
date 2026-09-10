@@ -14,10 +14,10 @@ use shared::{F32Vector3, F32Vector4};
 pub struct GameMan {
     vftable: usize,
     unk8: usize,
-    pub warp_requested: bool,
+    pub request_map_transition: bool,
     /// Target block ID for `MoveMapStep` to load/warp to.
     pub move_map_target: BlockId,
-    unk18: BlockId,
+    pub current_block_id: BlockId,
     unk1c: [u8; 0x4],
     /// Backup of local time when player is in someone else's world.
     /// See [crate::cs::WorldAreaTime::clock].
@@ -116,13 +116,13 @@ pub struct GameMan {
     /// Whether or not the player is currently "afk" and should not be summoned as hunter anymore.
     /// Set after certain time of inactivity while in someone else's world as a hunter.
     pub is_inactive: bool,
-    unkb5e: u8,
-    unkb5f: u8,
-    unkb60: u32,
-    unkb64: u32,
-    unkb68: u32,
-    unkb6c: u32,
-    pub new_game_plus_requested: bool,
+    pub warp_kick_flag: bool,
+    pub player_respawn_point_set: bool,
+    pub player_respawn_point: u32,
+    pub warp_player_area_entity_id: u32,
+    pub warp_origin_area_entity_id: u32,
+    pub world_map_dialog_entity_id: u32,
+    pub multipay_souls_buff_active: bool,
     unkb71: u8,
     pub save_requested: bool,
     unkb73: u8,
@@ -130,8 +130,8 @@ pub struct GameMan {
     unkb75: u8,
     /// Save slot index requested for loading.
     pub requested_save_slot_load_index: i32,
-    unkb7c: u8,
-    unkb7d: u8,
+    pub ending_credits_requested: bool,
+    pub next_lap_requested: bool,
     pub save_state: u32,
     unkb88: DLDateTime,
     unkb98: DLDateTime,
@@ -168,11 +168,14 @@ pub struct GameMan {
     /// See [CSStayInMultiplayAreaWarpData](crate::cs::CSStayInMultiplayAreaWarpData).
     pub stay_in_multiplay_area_saved_rotation: F32Vector4,
     unkc20: [u8; 0x20],
-    unkc40: F32Vector4,
-    unkc50: F32Vector4,
+    pub area_reload_physics_pos: F32Vector4,
+    pub area_reload_orientation: F32Vector4,
     pub sub_area_name_popup_message_id: i32,
     pub update_task: CSEzUpdateTask<CSEzTask, Self>,
-    unkc90: [u8; 0xf4],
+    pub area_reload_target_position: F32Vector4,
+    pub area_reload_target_orientation: F32Vector4,
+    pub area_reload_pending: bool,
+    unkcb1: [u8; 0xd3],
     pub summon_param_type: SummonParamType,
     pub multiplay_role: MultiplayRole,
     pub has_password: bool,

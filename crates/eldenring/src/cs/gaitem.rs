@@ -165,9 +165,9 @@ impl CSGaitemImp {
             ItemCategory::Accessory => Some(ItemHandle::NonIndexed(
                 self.make_goods_handle(GaitemCategory::Accessory, item_id.param_id()),
             )),
-            ItemCategory::Weapon | ItemCategory::Protector | ItemCategory::Gem => {
-                self.allocate_indexed_gaitem(item_id).map(ItemHandle::Indexed)
-            }
+            ItemCategory::Weapon | ItemCategory::Protector | ItemCategory::Gem => self
+                .allocate_indexed_gaitem(item_id)
+                .map(ItemHandle::Indexed),
         }
     }
 

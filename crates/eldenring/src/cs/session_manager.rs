@@ -119,7 +119,7 @@ pub struct CSSessionManager {
     protocol_state_2_timeout: FD4Time,
     unk1b8: usize,
     unk1c0: u8,
-    unk1c1: u8,
+    pub allow_map_reentry: bool,
     unk1c2: u8,
     unk1c3: u8,
     unk1c4: f32,

@@ -736,4 +736,3 @@ pub enum EquipmentDurabilityStatus {
     AtRisk = 1,
     Broken = 2,
 }
-
