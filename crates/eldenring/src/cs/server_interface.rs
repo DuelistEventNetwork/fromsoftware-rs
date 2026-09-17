@@ -1,3 +1,5 @@
+use std::ptr::NonNull;
+
 use crate::{DLVector, dlkr::CSNetworkAllocator, dltx::DLString, from_net::FNAllocator};
 use fromsoftware_shared::OwnedPtr;
 
@@ -6,7 +8,7 @@ use fromsoftware_shared::OwnedPtr;
 pub struct CSServerInterface {
     fn_client: usize,
     unk8: u32,
-    server_log_data_tracker: OwnedPtr<(), CSNetworkAllocator>,
+    pub server_log_data_tracker: OwnedPtr<CSServerLogDataTracker, CSNetworkAllocator>,
     net_player_watcher: OwnedPtr<(), CSNetworkAllocator>,
     unk20: usize,
     unk28: usize,
@@ -25,4 +27,10 @@ pub struct CSServerInterface {
     pub secondary_server_urls: DLVector<DLString>,
     unk198: usize,
     unk1a0: u32,
+}
+
+#[repr(C)]
+pub struct CSServerLogDataTracker {
+    fn_client: NonNull<()>,
+    pub multi_session_id: [u16; 32],
 }
