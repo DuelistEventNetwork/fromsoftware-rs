@@ -7,16 +7,24 @@ use crate::display::{DebugDisplay, DisplayUiExt};
 
 impl DebugDisplay for GameMan {
     fn render_debug(&self, ui: &Ui) {
-        ui.display("Warp Requested", self.warp_requested);
+        ui.display("Map Transition Requested", self.request_map_transition);
+        ui.display("Current Block ID", self.current_block_id);
         ui.display("Save Slot", self.save_slot);
         ui.display("Save State", self.save_state);
         ui.display("Save Requested", self.save_requested);
-        ui.display("New Game Plus Requested", self.new_game_plus_requested);
+        ui.display("Ending Credits Requested", self.ending_credits_requested);
+        ui.display("Next Lap Requested", self.next_lap_requested);
         ui.display("Is In Online Mode", self.is_in_online_mode);
         ui.display("Server Connection Enabled", self.server_connection_enabled);
         ui.display("Is Inactive", self.is_inactive);
+        ui.display("Warp Kick Flag", self.warp_kick_flag);
+        ui.display(
+            "Multipay Souls Buff Active",
+            self.multipay_souls_buff_active,
+        );
 
         ui.header("Map / Warp", || {
+            ui.display("Move Map Target", self.move_map_target);
             ui.display("Initial Area Entity ID", self.initial_area_entity_id);
             ui.display("Load Target Block ID", self.load_target_block_id);
             ui.nested("Last Load Position", self.last_load_position);
@@ -45,6 +53,41 @@ impl DebugDisplay for GameMan {
                 "Item Restore After QM Requested",
                 self.item_restore_after_qmrequested,
             );
+            ui.display("Player Respawn Point Set", self.player_respawn_point_set);
+            ui.display("Player Respawn Point", self.player_respawn_point);
+            ui.display(
+                "Warp Player Area Entity ID",
+                self.warp_player_area_entity_id,
+            );
+            ui.display(
+                "Warp Origin Area Entity ID",
+                self.warp_origin_area_entity_id,
+            );
+            ui.display(
+                "World Map Dialog Entity ID",
+                self.world_map_dialog_entity_id,
+            );
+            ui.display("Area Reload Pending", self.area_reload_pending);
+            ui.nested("Area Reload Physics Pos", self.area_reload_physics_pos);
+            ui.nested("Area Reload Orientation", self.area_reload_orientation);
+            ui.nested(
+                "Area Reload Target Position",
+                self.area_reload_target_position,
+            );
+            ui.nested(
+                "Area Reload Target Orientation",
+                self.area_reload_target_orientation,
+            );
+
+            ui.header("Stay In Multiplay Area", || {
+                ui.nested("Saved Position", self.stay_in_multiplay_area_saved_position);
+                ui.nested("Saved Rotation", self.stay_in_multiplay_area_saved_rotation);
+                ui.display("Saved Block ID", self.stay_in_multiplay_area_saved_block_id);
+            });
+        });
+
+        ui.header("World Area Time", || {
+            ui.nested("Backup", &self.world_area_time);
         });
 
         ui.header("Camera", || {
@@ -117,12 +160,6 @@ impl DebugDisplay for GameMan {
                 "Multiplay Join Orientation",
                 self.multiplay_join_orientation,
             );
-
-            ui.header("Stay In Multiplay Area", || {
-                ui.nested("Saved Position", self.stay_in_multiplay_area_saved_position);
-                ui.nested("Saved Rotation", self.stay_in_multiplay_area_saved_rotation);
-                ui.display("Saved Block ID", self.stay_in_multiplay_area_saved_block_id);
-            });
 
             ui.nested("Party Member Info", &self.party_member_info);
         });

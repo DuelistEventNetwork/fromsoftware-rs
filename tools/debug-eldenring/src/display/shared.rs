@@ -1,3 +1,4 @@
+use eldenring::dlut::DLDateTime;
 use eldenring::position::{BlockPosition, HavokPosition};
 use fromsoftware_shared::{
     F32Matrix2x2, F32Matrix2x3, F32Matrix2x4, F32Matrix3x2, F32Matrix3x3, F32Matrix3x4,
@@ -81,5 +82,20 @@ impl DebugDisplay for BlockPosition {
         ui.text(format!("y: {}", self.y));
         ui.text(format!("z: {}", self.z));
         ui.text(format!("yaw: {}", self.yaw));
+    }
+}
+
+impl DebugDisplay for &DLDateTime {
+    fn render_debug(&self, ui: &Ui) {
+        ui.text(format!(
+            "{:0>4}-{:0>2}-{:0>2} {:0>2}:{:0>2}:{:0>2}{}",
+            self.year(),
+            self.month(),
+            self.day(),
+            self.hours(),
+            self.minutes(),
+            self.seconds(),
+            if self.is_utc() { " UTC" } else { "" },
+        ));
     }
 }

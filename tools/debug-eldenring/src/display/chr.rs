@@ -878,46 +878,6 @@ impl DebugDisplay for InventoryItemsData {
             );
         });
 
-        let occupied_key = self.key_entries().iter().non_empty().count();
-        let label = format!(
-            "Key Items ({} occupied, len {}, cap {}, slots 0..)",
-            occupied_key, self.key_items_len, key_capacity,
-        );
-        ui.header(&label, || {
-            inventory_entry_table(ui, "inventory-items-data-key-items", self.key_entries(), 0);
-        });
-
-        // The accessor is what every read and write in the game actually goes
-        // through: it points at `key_items` in singleplayer and swaps to
-        // `multiplay_key_items` in multiplayer (`SwapKeyItemsAccessor`). If
-        // this doesn't match the Key Items table above, the session is in
-        // multiplayer.
-        let accessor_matches_key = std::ptr::eq(
-            self.key_entries().as_ptr(),
-            self.current_key_entries().as_ptr(),
-        );
-        ui.display(
-            "Key items accessor",
-            if accessor_matches_key {
-                "key_items (singleplayer)"
-            } else {
-                "multiplay_key_items"
-            },
-        );
-
-        let occupied_mp = self.multiplay_key_entries().iter().non_empty().count();
-        let label = format!(
-            "Multiplay Key Items ({} occupied, len {}, cap {}, slots 0..)",
-            occupied_mp, self.multiplay_key_items_len, self.multiplay_key_items_capacity,
-        );
-        ui.header(&label, || {
-            inventory_entry_table(
-                ui,
-                "inventory-items-data-multiplay-key-items",
-                self.multiplay_key_entries(),
-                0,
-            );
-        });
         ui.header("Item ID Map", || {
             ui.table(
                 "inventory-items-data-item-map",
